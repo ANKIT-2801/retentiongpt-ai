@@ -300,8 +300,14 @@ def get_llm_client():
     return client
 
 
-def make_context_text(ctx: dict, scored_df: pd.DataFrame, max_rows: int = 5) -> str:
-    """Turn model outputs into a richer text summary for the LLM."""
+def make_context_text(ctx: dict, scored_df: pd.DataFrame, max_rows: int = 5, max_cols: int = 12) -> str:
+    """
+    Turn model outputs into a richer text summary for the LLM.
+
+    It automatically profiles ALL columns:
+    - numeric columns: mean, min, max overall and (if available) in very high risk
+    - categorical columns: top categories overall and in very high risk
+    """
     lines = []
 
     n = ctx.get("n_customers")
@@ -317,7 +323,7 @@ def make_context_text(ctx: dict, scored_df: pd.DataFrame, max_rows: int = 5) -> 
     if p90_risk is not None:
         lines.append(f"Top 10% churn risk threshold: {p90_risk:.3f}")
 
-    # Risk band summary with counts
+    # Risk band summary
     if seg_summary is not None and not seg_summary.empty:
         lines.append("\nRisk band summary (band, customers, avg_churn_risk):")
         for _, row in seg_summary.iterrows():
@@ -325,35 +331,78 @@ def make_context_text(ctx: dict, scored_df: pd.DataFrame, max_rows: int = 5) -> 
                 f"- {row['risk_band']}: {int(row['customers'])} customers, avg risk {row['avg_churn_risk']:.3f}"
             )
 
-    # If we have risk_band + other features, add profiling for the VERY HIGH RISK band
-    if "risk_band" in scored_df.columns:
-        vh = scored_df[scored_df["risk_band"] == "Very high risk"].copy()
-        lines.append(f"\nVery high risk band size: {len(vh)} customers.")
+    # Prepare for column profiling
+    df = scored_df.copy()
+    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
 
-        # Helper to summarise a categorical column inside very high risk
-        def add_cat_profile(col_name: str, nice_name: str | None = None, top_k: int = 3):
-            if col_name in vh.columns:
-                name = nice_name or col_name
-                vc = vh[col_name].value_counts(normalize=True).head(top_k)
-                if not vc.empty:
-                    lines.append(f"\nTop {top_k} '{name}' values in very high risk band (share of that band):")
-                    for val, frac in vc.items():
-                        lines.append(f"- {val}: {frac * 100:.1f}%")
+    # Identify very high risk subset (if available)
+    vh = None
+    if "risk_band" in df.columns:
+        vh = df[df["risk_band"] == "Very high risk"].copy()
 
-        # Add profiles for a few likely columns if they exist
-        add_cat_profile("gender", "gender")
-        add_cat_profile("contract", "contract type")
-        add_cat_profile("paymentmethod", "payment method")
-        add_cat_profile("seniorcitizen", "senior citizen flag")
+    # Work out numeric vs categorical columns
+    ignore_cols = {"predicted_churn_proba", "risk_band"}
+    all_cols = [c for c in df.columns if c not in ignore_cols]
 
-    # Add a small sample of the scored data (IDs + risk + churn proba)
-    sample_cols = [c for c in ["customer_id", "risk_band", "predicted_churn_proba"] if c in scored_df.columns]
+    numeric_cols = df[all_cols].select_dtypes(include=[np.number]).columns.tolist()
+    cat_cols = [c for c in all_cols if c not in numeric_cols]
+
+    # Limit how many columns we dump into the prompt
+    numeric_cols = numeric_cols[: max_cols]
+    cat_cols = cat_cols[: max_cols]
+
+    # --- Numeric column profiles ---
+    if numeric_cols:
+        lines.append("\nNumeric feature profiles (overall, and very high risk if available):")
+        for col in numeric_cols:
+            series = df[col].dropna()
+            if series.empty:
+                continue
+
+            overall_mean = float(series.mean())
+            overall_min = float(series.min())
+            overall_max = float(series.max())
+
+            line = f"- {col}: overall mean={overall_mean:.3f}, min={overall_min:.3f}, max={overall_max:.3f}"
+
+            if vh is not None and col in vh.columns and not vh[col].dropna().empty:
+                vh_mean = float(vh[col].dropna().mean())
+                line += f"; very_high_risk_mean={vh_mean:.3f}"
+
+            lines.append(line)
+
+    # --- Categorical column profiles ---
+    if cat_cols:
+        lines.append("\nCategorical feature profiles (top categories overall and in very high risk):")
+        for col in cat_cols:
+            # Skip columns with too many unique values (IDs etc.)
+            if df[col].nunique(dropna=True) > 20:
+                continue
+
+            vc_all = df[col].value_counts(normalize=True).head(5)
+            if vc_all.empty:
+                continue
+
+            lines.append(f"\nColumn '{col}' overall distribution (top values):")
+            for val, frac in vc_all.items():
+                lines.append(f"- {val}: {frac * 100:.1f}% of all customers")
+
+            if vh is not None and col in vh.columns:
+                vc_vh = vh[col].value_counts(normalize=True).head(5)
+                if not vc_vh.empty:
+                    lines.append(f"Within VERY HIGH RISK band for '{col}':")
+                    for val, frac in vc_vh.items():
+                        lines.append(f"- {val}: {frac * 100:.1f}% of very high risk customers")
+
+    # Add a small raw sample for grounding
+    sample_cols = [c for c in ["customer_id", "risk_band", "predicted_churn_proba"] if c in df.columns]
     if sample_cols:
-        sample = scored_df[sample_cols].head(max_rows)
+        sample = df[sample_cols].head(max_rows)
         lines.append("\nSample of scored customers (first rows):")
         lines.append(sample.to_string(index=False))
 
     return "\n".join(lines)
+
 
 
 def ask_llm(question: str, ctx: dict, scored_df: pd.DataFrame):
