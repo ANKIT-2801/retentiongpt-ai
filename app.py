@@ -1,5 +1,6 @@
 import os
 import io
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -11,6 +12,8 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 
+from openai import OpenAI
+
 # ------------------------------------------------
 # Basic page config
 # ------------------------------------------------
@@ -21,13 +24,14 @@ st.set_page_config(
 )
 
 st.title("RetentionGPT – Telco Churn & Retention Assistant")
-st.caption("Upload telco data, run a churn model in the background, and ask questions about risk and retention strategy.")
+st.caption("Train a churn model on telco data, score customers, and ask an AI assistant for retention strategy.")
 
 DATA_DIR = "data"
 TRAIN_PATH = os.path.join(DATA_DIR, "final_data.csv")
 
+
 # ------------------------------------------------
-# Helpers
+# Helper functions
 # ------------------------------------------------
 def file_exists(path: str) -> bool:
     return os.path.exists(path) and os.path.getsize(path) > 0
@@ -47,8 +51,13 @@ def split_features_target(df: pd.DataFrame):
     y = df["churn_flag"].astype(int)
 
     # Drop obvious leakage / ID columns if present
-    drop_cols = ["churn_flag", "predicted_churn_proba", "predicted_ltv",
-                 "predicted_remaining_months", "customer_id"]
+    drop_cols = [
+        "churn_flag",
+        "predicted_churn_proba",
+        "predicted_ltv",
+        "predicted_remaining_months",
+        "customer_id",
+    ]
     drop_cols = [c for c in drop_cols if c in df.columns]
 
     X = df.drop(columns=drop_cols)
@@ -98,10 +107,8 @@ def score_dataset(df: pd.DataFrame, model, feature_cols):
     df = df.copy()
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
 
-    # Align features
     X = df[[c for c in feature_cols if c in df.columns]].copy()
 
-    # If target present, drop it for scoring
     if "churn_flag" in X.columns:
         X = X.drop(columns=["churn_flag"])
 
@@ -129,21 +136,19 @@ def score_dataset(df: pd.DataFrame, model, feature_cols):
 def build_context(scored_df: pd.DataFrame):
     ctx = {}
 
-    proba_col = "predicted_churn_proba"
-    if proba_col not in scored_df.columns:
+    if "predicted_churn_proba" not in scored_df.columns:
         return ctx
 
-    probas = scored_df[proba_col]
+    probas = scored_df["predicted_churn_proba"]
 
     ctx["avg_risk"] = float(np.nanmean(probas))
     ctx["p90_risk"] = float(np.nanpercentile(probas, 90))
     ctx["top_risk_count"] = int((probas >= np.nanpercentile(probas, 90)).sum())
     ctx["n_customers"] = len(scored_df)
 
-    # Risk-band summary
     if "risk_band" in scored_df.columns:
         seg_summary = (
-            scored_df.groupby("risk_band", dropna=False)[proba_col]
+            scored_df.groupby("risk_band", dropna=False)["predicted_churn_proba"]
             .agg(["count", "mean"])
             .reset_index()
             .rename(columns={"count": "customers", "mean": "avg_churn_risk"})
@@ -182,10 +187,11 @@ def parse_rank(text: str) -> int:
 
 
 def format_pct(x):
-    return f"{x*100:.1f}%"
+    return f"{x * 100:.1f}%"
 
 
 def assistant_response(question: str, intent: str, ctx: dict) -> str:
+    """Rule-based backup assistant (used if LLM fails)."""
     avg_risk = ctx.get("avg_risk")
     p90_risk = ctx.get("p90_risk")
     top_risk_count = ctx.get("top_risk_count")
@@ -203,8 +209,7 @@ def assistant_response(question: str, intent: str, ctx: dict) -> str:
             f"- Average churn risk: **{format_pct(avg_risk)}**\n"
             f"- Top 10% churn risk threshold: **{format_pct(p90_risk)}**\n"
             f"- Customers in that top-risk bucket: **{top_risk_count:,}**\n\n"
-            "You’d normally multiply those probabilities by ARPU or LTV to estimate revenue at risk. "
-            "If you add an LTV column, I can summarise that as well."
+            "You’d normally multiply those probabilities by ARPU or LTV to estimate revenue at risk."
         )
 
     if intent == "segment_strategy":
@@ -228,7 +233,7 @@ def assistant_response(question: str, intent: str, ctx: dict) -> str:
             f"- Average churn risk: **{format_pct(avg_seg_risk)}**\n\n"
             "Suggested focus:\n"
             "1. Review this segment’s profile in your dashboard (tenure, plan, usage, support tickets).\n"
-            "2. Design one or two targeted retention offers for this group.\n"
+            "2. Design targeted retention offers for this group.\n"
             "3. Track churn over the next 30–60 days to see if the risk actually drops."
         )
 
@@ -244,9 +249,9 @@ def assistant_response(question: str, intent: str, ctx: dict) -> str:
             "   - Action: Fast-track queueing or follow-up calls to close open issues.\n"
             "   - KPI: Ticket resolution time and churn rate.\n\n"
             "3) **Usage reactivation nudges**\n"
-            "   - Target: Medium-risk customers whose usage has dropped recently.\n"
+            "   - Target: Medium-risk customers whose usage has dropped.\n"
             "   - Action: In-app tips, bonus data, or reminder campaigns.\n"
-            "   - KPI: Change in usage and churn over 30–60 days."
+            "   - KPI: change in usage and churn over 30–60 days."
         )
 
     if intent == "churn_explain":
@@ -266,12 +271,10 @@ def assistant_response(question: str, intent: str, ctx: dict) -> str:
             "- tenure (short vs long)\n"
             "- contract type (month-to-month vs longer-term)\n"
             "- billing method and payment issues\n"
-            "- product usage and support tickets\n"
-            "Those patterns should be visible in your Tableau dashboard."
+            "- product usage and support tickets"
         )
         return "\n\n".join(lines)
 
-    # General help
     return (
         "I’ve run a churn model on your data and grouped customers into risk bands.\n\n"
         "You can ask things like:\n"
@@ -280,6 +283,92 @@ def assistant_response(question: str, intent: str, ctx: dict) -> str:
         "- *How much churn risk do we see overall?*\n"
         "- *What experiments should we run to reduce churn?*"
     )
+
+
+# ---------- LLM helpers (OpenRouter via OpenAI client) ----------
+
+@st.cache_resource(show_spinner=False)
+def get_llm_client():
+    """Create an OpenRouter client using the API key from Streamlit secrets."""
+    api_key = st.secrets.get("OPENROUTER_API_KEY")
+    if not api_key:
+        return None
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=api_key,
+    )
+    return client
+
+
+def make_context_text(ctx: dict, scored_df: pd.DataFrame, max_rows: int = 5) -> str:
+    """Turn model outputs into a short text summary for the LLM."""
+    lines = []
+
+    n = ctx.get("n_customers")
+    avg_risk = ctx.get("avg_risk")
+    p90_risk = ctx.get("p90_risk")
+    seg_summary = ctx.get("segment_summary")
+
+    if n:
+        lines.append(f"Total customers analysed: {n}")
+    if avg_risk is not None:
+        lines.append(f"Average predicted churn risk: {avg_risk:.3f}")
+    if p90_risk is not None:
+        lines.append(f"Top 10% churn risk threshold: {p90_risk:.3f}")
+
+    if seg_summary is not None and not seg_summary.empty:
+        lines.append("\nRisk band summary (band, customers, avg_churn_risk):")
+        for _, row in seg_summary.head(4).iterrows():
+            lines.append(
+                f"- {row['risk_band']}: {int(row['customers'])} customers, avg risk {row['avg_churn_risk']:.3f}"
+            )
+
+    sample_cols = [c for c in ["customer_id", "risk_band", "predicted_churn_proba"] if c in scored_df.columns]
+    if sample_cols:
+        sample = scored_df[sample_cols].head(max_rows)
+        lines.append("\nSample of scored customers (first rows):")
+        lines.append(sample.to_string(index=False))
+
+    return "\n".join(lines)
+
+
+def ask_llm(question: str, ctx: dict, scored_df: pd.DataFrame):
+    """Ask the LLM for an answer, using churn context. Returns None if LLM not available."""
+    client = get_llm_client()
+    if client is None:
+        return None
+
+    context_text = make_context_text(ctx, scored_df)
+
+    try:
+        completion = client.chat.completions.create(
+            model="openrouter/auto",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a senior customer retention and growth analyst. "
+                        "You are given churn model outputs for a telecom dataset. "
+                        "Use ONLY the provided context and general telco knowledge. "
+                        "Be concise, structured, and business-focused."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Here is the context from the churn model and risk bands:\n\n"
+                        f"{context_text}\n\n"
+                        f"Now answer this question from a product/growth/CS leader:\n{question}"
+                    ),
+                },
+            ],
+            max_tokens=450,
+            temperature=0.4,
+        )
+        return completion.choices[0].message.content.strip()
+    except Exception as e:
+        st.warning(f"LLM call failed, falling back to rule-based assistant. Details: {e}")
+        return None
 
 
 # ------------------------------------------------
@@ -296,7 +385,6 @@ model, feature_cols = train_churn_model(base_df)
 # Sidebar – upload new data
 # ------------------------------------------------
 st.sidebar.header("Data settings")
-
 st.sidebar.write("By default, the assistant uses the built-in training data.")
 st.sidebar.write("You can optionally upload a new telco CSV with the same columns to score a fresh dataset.")
 
@@ -333,8 +421,15 @@ with tab_chat:
     if user_q:
         st.session_state.messages.append({"role": "user", "content": user_q})
 
-        intent = detect_intent(user_q)
-        reply = assistant_response(user_q, intent, ctx)
+        # 1) Try LLM answer
+        llm_reply = ask_llm(user_q, ctx, scored_df)
+
+        if llm_reply:
+            reply = llm_reply
+        else:
+            # 2) Fallback to rule-based answer if LLM not available
+            intent = detect_intent(user_q)
+            reply = assistant_response(user_q, intent, ctx)
 
         with st.chat_message("assistant"):
             st.markdown(reply)
@@ -369,24 +464,23 @@ with tab_how:
     st.subheader("How this works (for your report & interviews)")
     st.markdown(
         """
-1. **Upload & training**  
-   The app loads `data/final_data.csv` (or an uploaded CSV) and trains a Logistic Regression churn model using `scikit-learn`.  
+1. **Model training**  
+   The app loads `data/final_data.csv` and trains a Logistic Regression churn model in scikit-learn.  
    It treats `churn_flag` as the target and uses the remaining columns as features (after dropping IDs and any existing prediction columns).
 
 2. **Scoring & segmentation**  
    The trained model scores each customer and creates a `predicted_churn_proba` column.  
-   Customers are then grouped into four named risk bands: **Low**, **Medium**, **High**, and **Very high risk**.
+   Customers are grouped into four named risk bands: **Low**, **Medium**, **High**, and **Very high risk**.
 
-3. **Assistant behaviour**  
-   The chat assistant does not call an external LLM.  
-   Instead, it uses rules on top of the model outputs to:
-   - identify the riskiest segments  
-   - summarise overall churn risk  
-   - suggest sensible retention experiments  
+3. **LLM assistant**  
+   The assistant summarises the churn outputs (risk bands, average risk, top 10%, sample rows) and sends that to an OpenRouter LLM.  
+   The LLM responds like a senior retention analyst.  
+   If the LLM isn’t available, a rule-based backup still gives reasonable answers.
 
-   This keeps the app completely free to run on Streamlit Cloud while still behaving like a focused retention “copilot”.
+4. **Uploading new data**  
+   You can upload a new cleaned telco CSV in the sidebar.  
+   The model scores that dataset on the fly, and the assistant’s answers are based on that new file.
 
-For your case study, you can describe this as an **end-to-end churn pipeline**:
-data → model → risk segmentation → interactive assistant for product / retention teams.
+This gives you a full story for your project: data → model → scoring → AI retention copilot.
 """
     )
