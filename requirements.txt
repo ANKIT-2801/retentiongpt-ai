@@ -1,12 +1,5 @@
-requirements = """
 streamlit
 pandas
 numpy
 scikit-learn
 joblib
-"""
-
-with open(os.path.join(PROJECT_DIR, "requirements.txt"), "w") as f:
-    f.write(requirements.strip())
-
-print("requirements.txt created")
