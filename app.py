@@ -301,7 +301,7 @@ def get_llm_client():
 
 
 def make_context_text(ctx: dict, scored_df: pd.DataFrame, max_rows: int = 5) -> str:
-    """Turn model outputs into a short text summary for the LLM."""
+    """Turn model outputs into a richer text summary for the LLM."""
     lines = []
 
     n = ctx.get("n_customers")
@@ -309,20 +309,44 @@ def make_context_text(ctx: dict, scored_df: pd.DataFrame, max_rows: int = 5) -> 
     p90_risk = ctx.get("p90_risk")
     seg_summary = ctx.get("segment_summary")
 
+    # Overall churn picture
     if n:
         lines.append(f"Total customers analysed: {n}")
     if avg_risk is not None:
-        lines.append(f"Average predicted churn risk: {avg_risk:.3f}")
+        lines.append(f"Average predicted churn risk (all customers): {avg_risk:.3f}")
     if p90_risk is not None:
         lines.append(f"Top 10% churn risk threshold: {p90_risk:.3f}")
 
+    # Risk band summary with counts
     if seg_summary is not None and not seg_summary.empty:
         lines.append("\nRisk band summary (band, customers, avg_churn_risk):")
-        for _, row in seg_summary.head(4).iterrows():
+        for _, row in seg_summary.iterrows():
             lines.append(
                 f"- {row['risk_band']}: {int(row['customers'])} customers, avg risk {row['avg_churn_risk']:.3f}"
             )
 
+    # If we have risk_band + other features, add profiling for the VERY HIGH RISK band
+    if "risk_band" in scored_df.columns:
+        vh = scored_df[scored_df["risk_band"] == "Very high risk"].copy()
+        lines.append(f"\nVery high risk band size: {len(vh)} customers.")
+
+        # Helper to summarise a categorical column inside very high risk
+        def add_cat_profile(col_name: str, nice_name: str | None = None, top_k: int = 3):
+            if col_name in vh.columns:
+                name = nice_name or col_name
+                vc = vh[col_name].value_counts(normalize=True).head(top_k)
+                if not vc.empty:
+                    lines.append(f"\nTop {top_k} '{name}' values in very high risk band (share of that band):")
+                    for val, frac in vc.items():
+                        lines.append(f"- {val}: {frac * 100:.1f}%")
+
+        # Add profiles for a few likely columns if they exist
+        add_cat_profile("gender", "gender")
+        add_cat_profile("contract", "contract type")
+        add_cat_profile("paymentmethod", "payment method")
+        add_cat_profile("seniorcitizen", "senior citizen flag")
+
+    # Add a small sample of the scored data (IDs + risk + churn proba)
     sample_cols = [c for c in ["customer_id", "risk_band", "predicted_churn_proba"] if c in scored_df.columns]
     if sample_cols:
         sample = scored_df[sample_cols].head(max_rows)
