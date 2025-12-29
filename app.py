@@ -103,16 +103,52 @@ def train_churn_model(df: pd.DataFrame):
 
 
 def score_dataset(df: pd.DataFrame, model, feature_cols):
-    """Apply trained model to any compatible dataset and add churn proba + risk band."""
+    """
+    Apply the trained model to any dataset and add churn proba + risk band.
+
+    Robust to:
+    - missing columns (fills them with NaN so the imputers use training defaults)
+    - extra columns (kept for LLM context but ignored by the model)
+    """
     df = df.copy()
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
 
-    X = df[[c for c in feature_cols if c in df.columns]].copy()
+    # Build X with EXACTLY the same columns and order used in training
+    X = pd.DataFrame(index=df.index)
+    missing_cols = []
+    for col in feature_cols:
+        if col in df.columns:
+            X[col] = df[col]
+        else:
+            # column was present during training but is missing now
+            # we create it filled with NaN; imputers will replace with training defaults
+            X[col] = np.nan
+            missing_cols.append(col)
 
-    if "churn_flag" in X.columns:
-        X = X.drop(columns=["churn_flag"])
+    # Nice-to-have: tell the user what’s going on
+    if missing_cols:
+        st.warning(
+            f"Uploaded data is missing {len(missing_cols)} feature columns that the model was trained on. "
+            "Those columns will use training defaults during scoring. "
+            f"Examples: {', '.join(missing_cols[:8])}"
+            + (" ..." if len(missing_cols) > 8 else "")
+        )
 
-    proba = model.predict_proba(X)[:, 1]
+    extra_cols = [c for c in df.columns if c not in feature_cols + ["churn_flag", "predicted_churn_proba", "risk_band"]]
+    if extra_cols:
+        st.info(
+            f"Uploaded data includes {len(extra_cols)} extra columns the model does not use. "
+            f"Examples: {', '.join(extra_cols[:8])}"
+            + (" ..." if len(extra_cols) > 8 else "")
+        )
+
+    # Predict churn probabilities
+    try:
+        proba = model.predict_proba(X)[:, 1]
+    except Exception as e:
+        st.error(f"Could not score the uploaded dataset with the trained model. Details: {e}")
+        raise
+
     df["predicted_churn_proba"] = proba
 
     # Create 4 risk bands: Low / Medium / High / Very high
@@ -123,7 +159,6 @@ def score_dataset(df: pd.DataFrame, model, feature_cols):
             labels=["Low risk", "Medium risk", "High risk", "Very high risk"]
         )
     except ValueError:
-        # Fallback if not enough unique values
         df["risk_band"] = pd.cut(
             df["predicted_churn_proba"],
             bins=[-0.01, 0.25, 0.5, 0.75, 1.0],
@@ -131,6 +166,7 @@ def score_dataset(df: pd.DataFrame, model, feature_cols):
         )
 
     return df
+
 
 
 def build_context(scored_df: pd.DataFrame):
