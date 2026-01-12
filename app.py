@@ -30,17 +30,22 @@ DATA_DIR = "data"
 TRAIN_PATH = os.path.join(DATA_DIR, "final_data.csv")
 
 # ------------------------------------------------
-# Helper functions
+# Utilities
 # ------------------------------------------------
 def file_exists(path: str) -> bool:
     return os.path.exists(path) and os.path.getsize(path) > 0
 
 
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out.columns = [c.strip().lower().replace(" ", "_") for c in out.columns]
+    return out
+
+
 @st.cache_data(show_spinner=False)
 def load_training_data(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
-    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
-    return df
+    return normalize_columns(df)
 
 
 def split_features_target(df: pd.DataFrame):
@@ -54,6 +59,7 @@ def split_features_target(df: pd.DataFrame):
         "predicted_churn_proba",
         "predicted_ltv",
         "predicted_remaining_months",
+        "risk_band",
         "customer_id",
     ]
     drop_cols = [c for c in drop_cols if c in df.columns]
@@ -66,9 +72,17 @@ def split_features_target(df: pd.DataFrame):
     return X, y, num_cols, cat_cols
 
 
+# ------------------------------------------------
+# Model training + scoring (dtype-safe)
+# ------------------------------------------------
 @st.cache_resource(show_spinner=True)
 def train_churn_model(df: pd.DataFrame):
-    """Train a simple, robust churn model from the training dataset."""
+    """
+    Train model and return:
+    - model pipeline
+    - feature_cols (raw features used)
+    - num_cols, cat_cols as seen in training
+    """
     X, y, num_cols, cat_cols = split_features_target(df)
 
     numeric_transformer = Pipeline(steps=[
@@ -97,18 +111,72 @@ def train_churn_model(df: pd.DataFrame):
 
     model.fit(X, y)
 
-    # IMPORTANT: return training feature columns in the exact order
-    return model, X.columns.tolist()
+    feature_cols = X.columns.tolist()
+    return model, feature_cols, num_cols, cat_cols
 
 
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    out.columns = [c.strip().lower().replace(" ", "_") for c in out.columns]
-    return out
+def score_dataset(df: pd.DataFrame, model, feature_cols, num_cols, cat_cols):
+    """
+    Score uploaded data robustly by enforcing training schema:
+    - missing columns -> created as NaN
+    - numeric cols -> coerced to numeric (bad strings -> NaN)
+    - categorical cols -> coerced to string (non-nulls)
+    """
+    df = normalize_columns(df)
+
+    # Build X with EXACT training columns & order
+    X = pd.DataFrame(index=df.index)
+    missing_cols = []
+    for col in feature_cols:
+        if col in df.columns:
+            X[col] = df[col]
+        else:
+            X[col] = np.nan
+            missing_cols.append(col)
+
+    # Enforce numeric types
+    for col in num_cols:
+        if col in X.columns:
+            X[col] = pd.to_numeric(X[col], errors="coerce")
+
+    # Enforce categorical types
+    for col in cat_cols:
+        if col in X.columns:
+            X[col] = X[col].where(X[col].isna(), X[col].astype(str))
+
+    if missing_cols:
+        st.warning(
+            f"Uploaded data is missing {len(missing_cols)} trained feature columns. "
+            "Those fields will use training defaults during scoring. "
+            f"Examples: {', '.join(missing_cols[:8])}"
+            + (" ..." if len(missing_cols) > 8 else "")
+        )
+
+    # Predict churn probabilities
+    proba = model.predict_proba(X)[:, 1]
+    df["predicted_churn_proba"] = proba
+
+    # Risk bands
+    try:
+        df["risk_band"] = pd.qcut(
+            df["predicted_churn_proba"],
+            q=4,
+            labels=["Low risk", "Medium risk", "High risk", "Very high risk"]
+        )
+    except ValueError:
+        df["risk_band"] = pd.cut(
+            df["predicted_churn_proba"],
+            bins=[-0.01, 0.25, 0.5, 0.75, 1.0],
+            labels=["Low risk", "Medium risk", "High risk", "Very high risk"]
+        )
+
+    return df
 
 
+# ------------------------------------------------
+# Coverage report + modes (Full / Limited / Data-only)
+# ------------------------------------------------
 def schema_report(upload_df: pd.DataFrame, feature_cols: list[str], core_cols: list[str]):
-    """Compute coverage and missing lists."""
     present_features = [c for c in feature_cols if c in upload_df.columns]
     missing_features = [c for c in feature_cols if c not in upload_df.columns]
 
@@ -135,12 +203,6 @@ def schema_report(upload_df: pd.DataFrame, feature_cols: list[str], core_cols: l
 
 
 def choose_mode(rep: dict, full_threshold: float = 0.80, limited_threshold: float = 0.50) -> str:
-    """
-    Mode logic:
-      - FULL: all core present OR >= full_threshold of total features
-      - LIMITED: core mostly present OR >= limited_threshold of total features
-      - DATA_ONLY: otherwise
-    """
     all_core_present = len(rep["missing_core"]) == 0
     if all_core_present or rep["coverage_all"] >= full_threshold:
         return "FULL"
@@ -149,64 +211,16 @@ def choose_mode(rep: dict, full_threshold: float = 0.80, limited_threshold: floa
     return "DATA_ONLY"
 
 
-def score_dataset(df: pd.DataFrame, model, feature_cols: list[str]):
-    """
-    Scores uploaded data with the trained model.
-    Robust to missing columns: creates them as NaN -> imputers use training defaults.
-    Extra columns are ignored for ML scoring.
-    """
-    df = normalize_columns(df)
-
-    X = pd.DataFrame(index=df.index)
-    missing_cols = []
-    for col in feature_cols:
-        if col in df.columns:
-            X[col] = df[col]
-        else:
-            X[col] = np.nan
-            missing_cols.append(col)
-
-    if missing_cols:
-        st.warning(
-            f"ML scoring note: {len(missing_cols)} trained feature columns are missing. "
-            "They will use training defaults during scoring. "
-            f"Examples: {', '.join(missing_cols[:8])}"
-            + (" ..." if len(missing_cols) > 8 else "")
-        )
-
-    # Predict churn probabilities
-    proba = model.predict_proba(X)[:, 1]
-    df["predicted_churn_proba"] = proba
-
-    # Risk bands
-    try:
-        df["risk_band"] = pd.qcut(
-            df["predicted_churn_proba"],
-            q=4,
-            labels=["Low risk", "Medium risk", "High risk", "Very high risk"]
-        )
-    except ValueError:
-        df["risk_band"] = pd.cut(
-            df["predicted_churn_proba"],
-            bins=[-0.01, 0.25, 0.5, 0.75, 1.0],
-            labels=["Low risk", "Medium risk", "High risk", "Very high risk"]
-        )
-
-    return df
-
-
 def build_context(scored_df: pd.DataFrame):
-    """Context for ML mode."""
     ctx = {}
     if "predicted_churn_proba" not in scored_df.columns:
         return ctx
 
     probas = scored_df["predicted_churn_proba"]
-
     ctx["avg_risk"] = float(np.nanmean(probas))
     ctx["p90_risk"] = float(np.nanpercentile(probas, 90))
     ctx["top_risk_count"] = int((probas >= np.nanpercentile(probas, 90)).sum())
-    ctx["n_customers"] = len(scored_df)
+    ctx["n_customers"] = int(len(scored_df))
 
     if "risk_band" in scored_df.columns:
         seg_summary = (
@@ -224,7 +238,6 @@ def build_context(scored_df: pd.DataFrame):
 
 
 def build_data_only_context(df: pd.DataFrame) -> dict:
-    """Context for Data-Only mode (no churn scoring)."""
     df = normalize_columns(df)
 
     ctx = {
@@ -237,18 +250,12 @@ def build_data_only_context(df: pd.DataFrame) -> dict:
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     cat_cols = [c for c in df.columns if c not in numeric_cols]
 
-    # Numeric summaries (keep compact)
     num_summary = {}
     for c in numeric_cols[:25]:
         s = df[c].dropna()
         if not s.empty:
-            num_summary[c] = {
-                "mean": float(s.mean()),
-                "min": float(s.min()),
-                "max": float(s.max())
-            }
+            num_summary[c] = {"mean": float(s.mean()), "min": float(s.min()), "max": float(s.max())}
 
-    # Categorical summaries (avoid very high-cardinality cols)
     cat_summary = {}
     for c in cat_cols:
         if df[c].nunique(dropna=True) <= 30:
@@ -260,83 +267,36 @@ def build_data_only_context(df: pd.DataFrame) -> dict:
 
     ctx["numeric_summary"] = num_summary
     ctx["cat_summary"] = cat_summary
-
     return ctx
 
 
-def detect_intent(text: str) -> str:
-    t = text.lower()
-    if any(k in t for k in ["why", "reason", "increase", "decrease", "driver", "cause"]):
-        return "churn_explain"
-    if any(k in t for k in ["segment", "cohort", "group", "prioritise", "prioritize", "which segment"]):
-        return "segment_strategy"
-    if any(k in t for k in ["experiment", "test", "a/b", "ab test", "hypothesis"]):
-        return "experiments"
-    if any(k in t for k in ["revenue", "ltv", "value", "at risk", "risk"]):
-        return "revenue"
-    return "general"
-
-
-def format_pct(x):
-    return f"{x * 100:.1f}%"
-
-
 # ------------------------------------------------
-# Core columns selection (Suggestion 2)
+# Core columns inference (Suggestion 2)
 # ------------------------------------------------
 def infer_core_columns_from_keywords(feature_cols: list[str]) -> list[str]:
-    """
-    Keyword-based fallback: picks likely 'core' telecom fields if present.
-    """
-    keywords = [
-        "tenure",
-        "contract",
-        "monthly",
-        "charges",
-        "payment",
-        "bill",
-        "internet",
-        "phone",
-        "service",
-        "totalcharges",
-    ]
-    hits = []
-    for c in feature_cols:
-        if any(k in c for k in keywords):
-            hits.append(c)
-    # Keep it small and stable
+    keywords = ["tenure", "contract", "monthly", "charge", "payment", "bill", "internet", "phone", "service", "total"]
+    hits = [c for c in feature_cols if any(k in c for k in keywords)]
     return hits[:8]
 
 
 @st.cache_data(show_spinner=False)
 def infer_core_columns_mi(train_df: pd.DataFrame, k: int = 7) -> list[str]:
-    """
-    Auto-detect core columns from training data using mutual information.
-    Works on original columns (not one-hot), so it’s easy to explain.
-    """
     X, y, num_cols, cat_cols = split_features_target(train_df)
 
-    # Basic cleaning and encoding (simple + stable)
     X2 = X.copy()
-
-    # Fill missing
     for c in num_cols:
         X2[c] = X2[c].fillna(X2[c].median())
     for c in cat_cols:
         X2[c] = X2[c].fillna("missing").astype(str)
 
-    # One-hot encode for MI calculation
     X_enc = pd.get_dummies(X2, columns=cat_cols, drop_first=False)
-
-    # Mutual information needs non-negative finite
     X_enc = X_enc.replace([np.inf, -np.inf], np.nan).fillna(0)
 
     mi = mutual_info_classif(X_enc, y, discrete_features=False, random_state=42)
     mi_series = pd.Series(mi, index=X_enc.columns).sort_values(ascending=False)
 
-    # Map dummy columns back to original columns
-    # Example: contract_month-to-month -> contract
     def base_col(dummy_name: str) -> str:
+        # best-effort mapping back to original
         return dummy_name.split("_")[0] if "_" in dummy_name else dummy_name
 
     scores = {}
@@ -345,12 +305,11 @@ def infer_core_columns_mi(train_df: pd.DataFrame, k: int = 7) -> list[str]:
         scores[b] = max(scores.get(b, 0.0), float(val))
 
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    core = [name for name, _ in ranked[:k]]
-    return core
+    return [name for name, _ in ranked[:k]]
 
 
 # ------------------------------------------------
-# LLM helpers
+# LLM helpers (OpenRouter)
 # ------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def get_llm_client():
@@ -361,12 +320,6 @@ def get_llm_client():
 
 
 def make_context_text_ml(ctx: dict, scored_df: pd.DataFrame, max_rows: int = 5, max_cols: int = 12) -> str:
-    """
-    ML mode context for the LLM:
-    - churn summary
-    - risk band summary
-    - automatic profiling across columns (compact)
-    """
     lines = []
     n = ctx.get("n_customers")
     avg_risk = ctx.get("avg_risk")
@@ -387,7 +340,6 @@ def make_context_text_ml(ctx: dict, scored_df: pd.DataFrame, max_rows: int = 5, 
 
     df = normalize_columns(scored_df)
 
-    # Identify very high risk subset
     vh = None
     if "risk_band" in df.columns:
         vh = df[df["risk_band"] == "Very high risk"].copy()
@@ -469,7 +421,7 @@ def ask_llm(question: str, mode: str, ctx: dict, scored_df: pd.DataFrame | None)
             "You are a senior telecom retention and growth analyst. "
             "Churn predictions are NOT available for this upload because key trained fields are missing. "
             "Answer using only the provided dataset summaries and general telecom reasoning. "
-            "Be transparent about limitations and suggest what additional fields would unlock deeper analysis."
+            "Be transparent about limitations and suggest what additional fields would unlock deeper churn analysis."
         )
     else:
         context_text = make_context_text_ml(ctx, scored_df)
@@ -479,7 +431,6 @@ def ask_llm(question: str, mode: str, ctx: dict, scored_df: pd.DataFrame | None)
             "Use ONLY the provided context and general telco knowledge. "
             "Be concise, structured, and business-focused."
         )
-
         if mode == "LIMITED":
             system_prompt += " Note: the dataset is missing several trained features, so scoring may be less reliable."
 
@@ -499,24 +450,26 @@ def ask_llm(question: str, mode: str, ctx: dict, scored_df: pd.DataFrame | None)
         return None
 
 
+def format_pct(x):
+    return f"{x * 100:.1f}%"
+
+
 # ------------------------------------------------
-# Load base training data and train model
+# Load training data and train model
 # ------------------------------------------------
 if not file_exists(TRAIN_PATH):
     st.error(f"Training file not found at `{TRAIN_PATH}`. Please add final_data.csv to the data/ folder.")
     st.stop()
 
 base_df = load_training_data(TRAIN_PATH)
-model, feature_cols = train_churn_model(base_df)
+model, feature_cols, num_cols, cat_cols = train_churn_model(base_df)
 
-# Core columns (auto)
+# Core columns (auto inference)
 core_cols_auto = infer_core_columns_mi(base_df, k=7)
-
-# If MI picks something odd (rare), fall back to keywords
 if len(core_cols_auto) < 4:
     core_cols_auto = infer_core_columns_from_keywords(feature_cols)
-    if len(core_cols_auto) < 4:
-        core_cols_auto = feature_cols[:7]
+if len(core_cols_auto) < 4:
+    core_cols_auto = feature_cols[:7]
 
 # ------------------------------------------------
 # Sidebar
@@ -524,7 +477,6 @@ if len(core_cols_auto) < 4:
 st.sidebar.header("Data settings")
 st.sidebar.write("Upload a telecom-style CSV. The app adapts based on how complete the input is.")
 
-# Allow override if you want
 use_custom_core = st.sidebar.checkbox("Override core columns (advanced)", value=False)
 if use_custom_core:
     core_cols = st.sidebar.multiselect(
@@ -537,12 +489,12 @@ if use_custom_core:
 else:
     core_cols = core_cols_auto
 
-st.sidebar.caption(f"Core columns currently used: {', '.join(core_cols)}")
+st.sidebar.caption(f"Core columns used: {', '.join(core_cols)}")
 
 uploaded_file = st.sidebar.file_uploader("Upload new customer data (CSV)", type=["csv"])
 
 # ------------------------------------------------
-# Process dataset + mode selection
+# Decide mode and process dataset
 # ------------------------------------------------
 mode = "FULL"
 rep = None
@@ -555,7 +507,6 @@ if uploaded_file is not None:
     rep = schema_report(uploaded_df, feature_cols, core_cols)
     mode = choose_mode(rep, full_threshold=0.80, limited_threshold=0.50)
 
-    # Show a clear status (this is the UX part that prevents “it’s broken”)
     st.sidebar.markdown("### Input quality check")
     st.sidebar.write(f"Feature coverage: **{rep['coverage_all']*100:.0f}%**")
     st.sidebar.write(f"Core coverage: **{rep['coverage_core']*100:.0f}%**")
@@ -571,17 +522,23 @@ if uploaded_file is not None:
         ctx = build_data_only_context(scored_df)
         st.sidebar.warning("Data-Only mode: churn scoring is disabled for this upload.")
     else:
-        scored_df = score_dataset(uploaded_df, model, feature_cols)
-        ctx = build_context(scored_df)
-        ctx["mode"] = mode
+        try:
+            scored_df = score_dataset(uploaded_df, model, feature_cols, num_cols, cat_cols)
+            ctx = build_context(scored_df)
+            ctx["mode"] = mode
 
-        if mode == "LIMITED":
-            st.sidebar.warning("Limited mode: churn scoring runs, but missing fields may reduce reliability.")
-        else:
-            st.sidebar.success("Full mode: churn scoring enabled.")
+            if mode == "LIMITED":
+                st.sidebar.warning("Limited mode: churn scoring runs, but missing fields may reduce reliability.")
+            else:
+                st.sidebar.success("Full mode: churn scoring enabled.")
+        except Exception:
+            # If scoring fails due to ugly types, fall back instead of crashing the product
+            scored_df = uploaded_df.copy()
+            ctx = build_data_only_context(scored_df)
+            mode = "DATA_ONLY"
+            st.sidebar.warning("Scoring failed due to schema/type mismatch. Switched to Data-Only mode for this upload.")
 else:
-    # Default training dataset
-    scored_df = score_dataset(base_df, model, feature_cols)
+    scored_df = score_dataset(base_df, model, feature_cols, num_cols, cat_cols)
     ctx = build_context(scored_df)
     ctx["mode"] = "FULL"
     st.sidebar.info("Using default training data (Full mode).")
@@ -596,9 +553,9 @@ with tab_chat:
 
     if mode == "DATA_ONLY":
         st.info(
-            "This upload is missing key churn fields, so **predictions are disabled**. "
+            "This upload is missing key churn fields (or has incompatible types), so **predictions are disabled**. "
             "You can still ask questions and get descriptive insights. "
-            "For churn scoring, upload more of the core telecom fields."
+            "For churn scoring, upload a dataset closer to the telecom template."
         )
     elif mode == "LIMITED":
         st.warning(
@@ -622,17 +579,17 @@ with tab_chat:
         if llm_reply:
             reply = llm_reply
         else:
-            # Fallback if no LLM key
+            # If no LLM key, give a useful fallback message
             if mode == "DATA_ONLY":
                 reply = (
-                    "I can’t use the AI assistant right now (missing API key or request failed). "
-                    "But I can still summarise the dataset in the Data Preview tab."
+                    "AI assistant is not available right now (missing API key or request failed). "
+                    "You can still review the dataset summary in the Data Preview tab."
                 )
             else:
-                # basic fallback summary
                 reply = (
                     f"Customers analysed: {ctx.get('n_customers', 0):,}\n\n"
-                    f"Avg churn risk: {format_pct(ctx.get('avg_risk', 0.0))} (if scoring enabled)"
+                    f"Avg churn risk: {format_pct(ctx.get('avg_risk', 0.0))}\n"
+                    f"Top 10% threshold: {format_pct(ctx.get('p90_risk', 0.0))}"
                 )
 
         with st.chat_message("assistant"):
@@ -664,17 +621,12 @@ with tab_how:
 
     st.markdown(
         """
-**RetentionGPT runs in three modes depending on upload completeness:**
+**RetentionGPT adapts to the quality of the uploaded file.**
 
-- **Full Mode:** Enough core fields (or ~80% of trained fields).  
-  The model scores churn risk and creates risk bands.
+- **Full Mode:** enough core fields (or ~80% of trained fields) are present → churn scoring + risk bands + AI insights  
+- **Limited Mode:** partial coverage (~50–80%) → churn scoring still runs, but results are directional  
+- **Data-Only Mode:** too many missing core fields or incompatible types → predictions are disabled, but the AI provides descriptive insights and suggests what data to add for deeper analysis
 
-- **Limited Mode:** Partial coverage (~50–80% or partial core).  
-  The model still scores, but predictions are less reliable.
-
-- **Data-Only Mode:** Too many missing core fields.  
-  Predictions are disabled, but the assistant still provides descriptive insights from the uploaded data and suggests what fields to add for deeper churn analysis.
-
-This design prevents the product from feeling “broken” when users upload incomplete datasets.
+This prevents the tool from feeling “broken” when users upload imperfect datasets.
 """
     )
