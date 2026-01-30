@@ -13,7 +13,7 @@ from sklearn.linear_model import LogisticRegression
 from openai import OpenAI
 
 # ------------------------------------------------
-# Page config
+# Page setup
 # ------------------------------------------------
 st.set_page_config(
     page_title="RetentionGPT – Telco Churn Assistant",
@@ -28,58 +28,41 @@ DATA_DIR = "data"
 TRAIN_PATH = os.path.join(DATA_DIR, "final_data.csv")
 
 # ------------------------------------------------
-# Helpers
+# Utilities
 # ------------------------------------------------
-def file_exists(path: str) -> bool:
-    return os.path.exists(path) and os.path.getsize(path) > 0
-
-
-@st.cache_data(show_spinner=False)
-def load_training_data(path: str) -> pd.DataFrame:
+def load_csv(path):
     df = pd.read_csv(path)
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
     return df
 
 
-def split_features_target(df: pd.DataFrame):
-    if "churn_flag" not in df.columns:
-        raise ValueError("Training data must contain 'churn_flag'.")
-
+def split_xy(df):
     y = df["churn_flag"].astype(int)
 
-    drop_cols = [
-        "churn_flag",
-        "predicted_churn_proba",
-        "risk_band",
-        "customer_id",
-    ]
+    drop_cols = ["churn_flag", "predicted_churn_proba", "risk_band", "customer_id"]
     drop_cols = [c for c in drop_cols if c in df.columns]
 
     X = df.drop(columns=drop_cols)
 
-    num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
-    cat_cols = [c for c in X.columns if c not in num_cols]
+    num = X.select_dtypes(include=[np.number]).columns.tolist()
+    cat = [c for c in X.columns if c not in num]
 
-    return X, y, num_cols, cat_cols
+    return X, y, num, cat
 
 
-@st.cache_resource(show_spinner=True)
-def train_churn_model(df: pd.DataFrame):
-    X, y, num_cols, cat_cols = split_features_target(df)
-
-    numeric_pipe = Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler", StandardScaler())
-    ])
-
-    categorical_pipe = Pipeline([
-        ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("onehot", OneHotEncoder(handle_unknown="ignore"))
-    ])
+@st.cache_resource
+def train_model(train_df):
+    X, y, num_cols, cat_cols = split_xy(train_df)
 
     preprocessor = ColumnTransformer([
-        ("num", numeric_pipe, num_cols),
-        ("cat", categorical_pipe, cat_cols),
+        ("num", Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler())
+        ]), num_cols),
+        ("cat", Pipeline([
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("onehot", OneHotEncoder(handle_unknown="ignore"))
+        ]), cat_cols),
     ])
 
     model = Pipeline([
@@ -88,128 +71,120 @@ def train_churn_model(df: pd.DataFrame):
     ])
 
     model.fit(X, y)
-
     return model, X.columns.tolist()
 
 
-def score_dataset(df: pd.DataFrame, model, feature_cols):
+def score(df, model, features):
     df = df.copy()
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
 
     X = pd.DataFrame(index=df.index)
-    for col in feature_cols:
-        X[col] = df[col] if col in df.columns else np.nan
+    for f in features:
+        X[f] = df[f] if f in df.columns else np.nan
 
-    proba = model.predict_proba(X)[:, 1]
-    df["predicted_churn_proba"] = proba
-
+    df["predicted_churn_proba"] = model.predict_proba(X)[:, 1]
     df["risk_band"] = pd.qcut(
         df["predicted_churn_proba"],
-        q=4,
+        4,
         labels=["Low risk", "Medium risk", "High risk", "Very high risk"]
     )
-
     return df
 
 
-def build_context(scored_df: pd.DataFrame):
-    ctx = {}
-    p = scored_df["predicted_churn_proba"]
+def build_summary(df):
+    p = df["predicted_churn_proba"]
 
-    ctx["n_customers"] = len(scored_df)
-    ctx["avg_risk"] = float(p.mean())
-    ctx["p90_risk"] = float(np.percentile(p, 90))
-
-    ctx["segment_summary"] = (
-        scored_df.groupby("risk_band")["predicted_churn_proba"]
-        .agg(customers="count", avg_churn_risk="mean")
-        .reset_index()
-        .sort_values("avg_churn_risk", ascending=False)
-    )
-
-    return ctx
+    return {
+        "customers": len(df),
+        "avg_risk": float(p.mean()),
+        "p90": float(np.percentile(p, 90)),
+        "segments": (
+            df.groupby("risk_band")["predicted_churn_proba"]
+            .agg(customers="count", avg_risk="mean")
+            .reset_index()
+            .sort_values("avg_risk", ascending=False)
+        )
+    }
 
 
 # ------------------------------------------------
 # LLM
 # ------------------------------------------------
-@st.cache_resource(show_spinner=False)
-def get_llm_client():
-    api_key = st.secrets.get("OPENROUTER_API_KEY")
-    if not api_key:
+@st.cache_resource
+def get_llm():
+    key = st.secrets.get("OPENROUTER_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+    if not key:
         return None
 
     return OpenAI(
         base_url="https://openrouter.ai/api/v1",
-        api_key=api_key
+        api_key=key
     )
 
 
-def ask_llm(question: str, ctx: dict):
-    client = get_llm_client()
+def ask_llm(question, summary):
+    client = get_llm()
     if client is None:
-        return None
+        raise RuntimeError("LLM not connected")
 
-    context_text = f"""
-Customers analysed: {ctx['n_customers']}
-Average churn risk: {ctx['avg_risk']:.3f}
-Top 10% threshold: {ctx['p90_risk']:.3f}
+    context = f"""
+Customers: {summary['customers']}
+Average churn risk: {summary['avg_risk']:.3f}
+Top 10% threshold: {summary['p90']:.3f}
 
-Risk bands:
-{ctx['segment_summary'].to_string(index=False)}
+Risk segments:
+{summary['segments'].to_string(index=False)}
 """
 
-    completion = client.chat.completions.create(
-        model="openrouter/auto",
+    res = client.chat.completions.create(
+        model="google/gemini-1.5-flash",
         messages=[
-            {
-                "role": "system",
-                "content": "You are a senior telecom retention analyst. Be concise and business-focused."
-            },
-            {
-                "role": "user",
-                "content": f"{context_text}\n\nQuestion: {question}"
-            }
+            {"role": "system", "content": "You are a senior telecom retention analyst."},
+            {"role": "user", "content": f"{context}\n\nQuestion: {question}"}
         ],
         temperature=0.4,
         max_tokens=400
     )
 
-    return completion.choices[0].message.content.strip()
+    return res.choices[0].message.content.strip()
+
+
+def fallback_answer(summary):
+    top = summary["segments"].iloc[0]
+    return (
+        f"Highest risk segment: {top['risk_band']} "
+        f"({int(top['customers'])} customers, "
+        f"avg risk {top['avg_risk']*100:.1f}%). "
+        "Focus retention efforts here first."
+    )
 
 
 # ------------------------------------------------
-# Train model (hidden from users)
+# Train once (hidden)
 # ------------------------------------------------
-if not file_exists(TRAIN_PATH):
+if not os.path.exists(TRAIN_PATH):
     st.error("Training file missing: data/final_data.csv")
     st.stop()
 
-train_df = load_training_data(TRAIN_PATH)
-model, feature_cols = train_churn_model(train_df)
+train_df = load_csv(TRAIN_PATH)
+model, features = train_model(train_df)
 
 # ------------------------------------------------
-# Sidebar upload
+# Upload
 # ------------------------------------------------
 st.sidebar.header("Data settings")
-st.sidebar.write("Upload a telco CSV to run churn analysis.")
-
-uploaded_file = st.sidebar.file_uploader("Upload customer data (CSV)", type=["csv"])
+uploaded = st.sidebar.file_uploader("Upload customer CSV", type="csv")
 
 scored_df = None
-ctx = {}
+summary = None
 
-if uploaded_file is not None:
-    raw = uploaded_file.read()
-    user_df = pd.read_csv(io.BytesIO(raw))
-    scored_df = score_dataset(user_df, model, feature_cols)
-    ctx = build_context(scored_df)
-
-    st.sidebar.success("Dataset uploaded and scored.")
-
-
+if uploaded:
+    user_df = load_csv(io.BytesIO(uploaded.read()))
+    scored_df = score(user_df, model, features)
+    summary = build_summary(scored_df)
+    st.sidebar.success("Dataset uploaded and analysed")
 else:
-    st.sidebar.info("No dataset uploaded yet.")
+    st.sidebar.info("Upload a dataset to begin")
 
 # ------------------------------------------------
 # Tabs
@@ -218,7 +193,7 @@ tab_chat, tab_data, tab_how = st.tabs(["Chat assistant", "Data preview", "How it
 
 with tab_chat:
     if scored_df is None:
-        st.info("Upload a dataset to enable the assistant.")
+        st.info("Upload data to enable the assistant.")
         st.stop()
 
     if "messages" not in st.session_state:
@@ -231,36 +206,40 @@ with tab_chat:
     q = st.chat_input("Ask about churn, segments, or retention strategy")
     if q:
         st.session_state.messages.append({"role": "user", "content": q})
+        try:
+            answer = ask_llm(q, summary)
+        except Exception:
+            answer = fallback_answer(summary)
 
-        reply = ask_llm(q, ctx) or "LLM unavailable."
         with st.chat_message("assistant"):
-            st.markdown(reply)
+            st.markdown(answer)
 
-        st.session_state.messages.append({"role": "assistant", "content": reply})
+        st.session_state.messages.append({"role": "assistant", "content": answer})
 
 
 with tab_data:
     if scored_df is None:
-        st.info("Upload a dataset to see results.")
+        st.info("Upload data to see results.")
         st.stop()
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("Customers", f"{ctx['n_customers']:,}")
-    c2.metric("Avg churn risk", f"{ctx['avg_risk']*100:.1f}%")
-    c3.metric("Top 10% threshold", f"{ctx['p90_risk']*100:.1f}%")
+    c1.metric("Customers", summary["customers"])
+    c2.metric("Avg churn risk", f"{summary['avg_risk']*100:.1f}%")
+    c3.metric("Top 10% threshold", f"{summary['p90']*100:.1f}%")
 
     st.dataframe(scored_df.head(25), use_container_width=True)
-    st.dataframe(ctx["segment_summary"], use_container_width=True)
+    st.dataframe(summary["segments"], use_container_width=True)
 
 
 with tab_how:
     st.markdown("""
 **How it works**
 
-1. A churn model is trained once on internal telco data.
-2. Users upload their own dataset.
-3. The model scores churn probability and assigns risk bands.
-4. An AI assistant answers questions using only the uploaded data.
+• The app learns churn patterns from internal data  
+• Your uploaded file is analysed separately  
+• Customers are grouped by churn risk  
+• AI explains insights and actions  
+• If AI is unavailable, the app still responds  
 
-Training data is never exposed to users.
+No training data is ever shown to users.
 """)
