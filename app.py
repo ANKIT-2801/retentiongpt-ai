@@ -206,7 +206,7 @@ if uploaded_file is not None:
     ctx = build_context(scored_df)
 
     st.sidebar.success("Dataset uploaded and scored.")
-    st.session_state.messages = []
+
 
 else:
     st.sidebar.info("No dataset uploaded yet.")
