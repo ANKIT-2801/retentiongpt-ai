@@ -497,6 +497,22 @@ st.sidebar.header("Data settings")
 st.sidebar.write("Upload a telco CSV to run churn scoring + AI analysis.")
 
 uploaded_file = st.sidebar.file_uploader("Upload new customer data (CSV)", type=["csv"])
+# ---- Clear chat when dataset changes ----
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+if "active_file_key" not in st.session_state:
+    st.session_state.active_file_key = None
+
+new_file_key = None
+if uploaded_file is not None:
+    # unique enough for most cases (name + size)
+    new_file_key = (uploaded_file.name, uploaded_file.size)
+
+# If user uploads a different file OR removes the file, reset chat
+if new_file_key != st.session_state.active_file_key:
+    st.session_state.messages = []
+    st.session_state.active_file_key = new_file_key
 
 scored_df = None
 ctx = {}
