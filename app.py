@@ -494,22 +494,25 @@ model, feature_cols = train_churn_model(base_df)
 # Sidebar – upload new data
 # ------------------------------------------------
 st.sidebar.header("Data settings")
-st.sidebar.write("By default, the assistant uses the built-in training data.")
-st.sidebar.write("You can optionally upload a new telco CSV with the same columns to score a fresh dataset.")
+st.sidebar.write("Upload a telco CSV to run churn scoring + AI analysis.")
 
 uploaded_file = st.sidebar.file_uploader("Upload new customer data (CSV)", type=["csv"])
+
+scored_df = None
+ctx = {}
 
 if uploaded_file is not None:
     raw_bytes = uploaded_file.read()
     uploaded_df = pd.read_csv(io.BytesIO(raw_bytes))
     uploaded_df.columns = [c.strip().lower().replace(" ", "_") for c in uploaded_df.columns]
+
     scored_df = score_dataset(uploaded_df, model, feature_cols)
+    ctx = build_context(scored_df)
+
     st.sidebar.success("Using uploaded data for analysis.")
 else:
-    scored_df = score_dataset(base_df, model, feature_cols)
-    st.sidebar.info("Using default training data.")
+    st.sidebar.info("No dataset uploaded yet. Please upload a CSV to continue.")
 
-ctx = build_context(scored_df)
 
 # ------------------------------------------------
 # Main layout – tabs
@@ -518,6 +521,9 @@ tab_chat, tab_data, tab_how = st.tabs(["Chat assistant", "Data preview", "How it
 
 with tab_chat:
     st.subheader("Ask questions about churn, risk bands, and retention strategy")
+    if scored_df is None:
+        st.info("Upload a dataset in the sidebar to enable the assistant.")
+        st.stop()
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
@@ -547,6 +553,9 @@ with tab_chat:
 
 with tab_data:
     st.subheader("Scored dataset preview")
+    if scored_df is None:
+        st.info("Upload a dataset in the sidebar to see the preview.")
+        st.stop()
 
     c1, c2, c3 = st.columns(3)
     with c1:
