@@ -1,5 +1,6 @@
 import os
 import io
+import re
 
 import streamlit as st
 import pandas as pd
@@ -24,38 +25,154 @@ st.set_page_config(
 )
 
 st.title("RetentionGPT – Telco Churn & Retention Assistant")
-st.caption("Train a churn model on telco data, score customers, and ask an AI assistant for retention strategy.")
+st.caption("Upload a telco dataset, score customers, and ask an AI assistant for retention strategy.")
 
 DATA_DIR = "data"
 TRAIN_PATH = os.path.join(DATA_DIR, "final_data.csv")
 
+TARGET_DEFAULT = "churn_flag"
 
 # ------------------------------------------------
-# Helper functions
+# Column helpers / cleaning
 # ------------------------------------------------
-def file_exists(path: str) -> bool:
-    return os.path.exists(path) and os.path.getsize(path) > 0
+MISSING_TOKENS = {"", " ", "na", "n/a", "null", "none", "-", "--", "nan"}
+
+# Common “core” business concepts we try to detect (by name first)
+SYNONYMS = {
+    "tenure_months": ["tenure", "tenure_months", "months_active", "customer_tenure", "months_with_company"],
+    "monthly_charge": ["monthly_charge", "monthlycharges", "mrc", "monthly_fee", "monthlyamount", "monthlycost"],
+    "total_charge": ["total_charge", "totalcharges", "lifetime_charge", "totalamount", "total_billed"],
+    "contract": ["contract", "contract_type", "plan_contract"],
+    "paymentmethod": ["paymentmethod", "payment_method", "pay_method", "payment_type"],
+    "internetservice": ["internetservice", "internet_service", "net_service", "broadband"],
+    "customer_id": ["customer_id", "cust_id", "subscriber_id", "account_id", "id"],
+    TARGET_DEFAULT: ["churn", "churn_flag", "is_churn", "churned", "target"],
+}
+
+CORE_SIGNALS = {"tenure_months", "monthly_charge"}  # keep small + realistic
 
 
-@st.cache_data(show_spinner=False)
-def load_training_data(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
+def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
     return df
 
 
-def split_features_target(df: pd.DataFrame):
-    if "churn_flag" not in df.columns:
-        raise ValueError("Dataset must contain a 'churn_flag' column.")
+def _looks_like_money(series: pd.Series) -> bool:
+    if series.dtype != "object":
+        return False
+    s = series.dropna().astype(str).head(50)
+    if s.empty:
+        return False
+    # If many values contain $ or commas or look numeric-ish with decimals
+    moneyish = s.str.contains(r"[$,]") | s.str.match(r"^\s*\d+(\.\d+)?\s*$")
+    return float(moneyish.mean()) > 0.7
 
-    y = df["churn_flag"].astype(int)
 
-    # Drop obvious leakage / ID columns if present
+def _to_number_safe(series: pd.Series) -> pd.Series:
+    # strip $, commas
+    s = series.astype(str).str.replace(",", "", regex=False).str.replace("$", "", regex=False).str.strip()
+    return pd.to_numeric(s, errors="coerce")
+
+
+def _to_bool01(series: pd.Series) -> pd.Series:
+    s = series.astype(str).str.strip().str.lower()
+    true_set = {"yes", "y", "true", "1", "t"}
+    false_set = {"no", "n", "false", "0", "f"}
+    out = pd.Series(np.nan, index=series.index)
+    out[s.isin(true_set)] = 1
+    out[s.isin(false_set)] = 0
+    return out
+
+
+def clean_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Production-friendly cleaning:
+    - normalize column names
+    - normalize missing tokens to NaN
+    - convert yes/no columns to 0/1 where appropriate
+    - convert money-ish strings to numeric
+    - drop ID-like columns (too many unique values)
+    """
+    df = normalize_cols(df)
+
+    # normalize missing tokens
+    for c in df.columns:
+        if df[c].dtype == "object":
+            df[c] = df[c].astype(str).str.strip()
+            df.loc[df[c].str.lower().isin(MISSING_TOKENS), c] = np.nan
+
+    # convert yes/no-like columns
+    for c in df.columns:
+        if df[c].dtype == "object":
+            s = df[c].dropna().astype(str).str.lower()
+            if s.empty:
+                continue
+            # if most values are yes/no style
+            if float(s.isin({"yes", "no", "true", "false", "y", "n", "0", "1", "t", "f"}).mean()) > 0.85:
+                df[c] = _to_bool01(df[c])
+
+    # convert money-ish strings
+    for c in df.columns:
+        if _looks_like_money(df[c]):
+            df[c] = _to_number_safe(df[c])
+
+    # drop obvious ID-like columns (high-cardinality strings)
+    # keep customer_id if present; we'll treat it as special later
+    for c in list(df.columns):
+        if c == "customer_id":
+            continue
+        if df[c].dtype == "object":
+            nun = df[c].nunique(dropna=True)
+            if nun > max(50, int(0.8 * len(df))):  # very high uniqueness
+                df.drop(columns=[c], inplace=True)
+
+    return df
+
+
+# ------------------------------------------------
+# Schema / matching helpers
+# ------------------------------------------------
+def _best_match(col: str, candidates: list[str]) -> bool:
+    col_clean = re.sub(r"[^a-z0-9_]", "", col.lower())
+    for cand in candidates:
+        cand_clean = re.sub(r"[^a-z0-9_]", "", cand.lower())
+        if col_clean == cand_clean:
+            return True
+    return False
+
+
+def apply_synonym_renames(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Rename uploaded columns to our internal standard where we can.
+    No UI. Name-based only.
+    """
+    df = normalize_cols(df)
+    rename_map = {}
+    for internal_name, name_list in SYNONYMS.items():
+        for c in df.columns:
+            if _best_match(c, name_list):
+                rename_map[c] = internal_name
+                break
+    if rename_map:
+        df = df.rename(columns=rename_map)
+    return df
+
+
+def split_features_target(df: pd.DataFrame, target: str = TARGET_DEFAULT):
+    if target not in df.columns:
+        raise ValueError(f"Dataset must contain a '{target}' column for training.")
+
+    y = df[target].astype(int)
+
     drop_cols = [
-        "churn_flag",
+        target,
         "predicted_churn_proba",
         "predicted_ltv",
         "predicted_remaining_months",
+        "risk_band",
+        "segment_id",
+        "cluster",
         "customer_id",
     ]
     drop_cols = [c for c in drop_cols if c in df.columns]
@@ -68,10 +185,13 @@ def split_features_target(df: pd.DataFrame):
     return X, y, num_cols, cat_cols
 
 
-@st.cache_resource(show_spinner=True)
-def train_churn_model(df: pd.DataFrame):
-    """Train a simple, robust churn model from the training dataset."""
-    X, y, num_cols, cat_cols = split_features_target(df)
+def train_churn_model(df: pd.DataFrame, target: str = TARGET_DEFAULT):
+    """
+    Train churn model on the training dataset and return:
+    - model pipeline
+    - feature_cols (exact training feature list, in order)
+    """
+    X, y, num_cols, cat_cols = split_features_target(df, target=target)
 
     numeric_transformer = Pipeline(steps=[
         ("imputer", SimpleImputer(strategy="median")),
@@ -102,56 +222,54 @@ def train_churn_model(df: pd.DataFrame):
     return model, X.columns.tolist()
 
 
-def score_dataset(df: pd.DataFrame, model, feature_cols):
+def decide_mode(upload_df: pd.DataFrame, training_feature_cols: list[str], target: str = TARGET_DEFAULT):
     """
-    Apply the trained model to any dataset and add churn proba + risk band.
+    Returns one of:
+    - "pretrained"        -> score with our pre-trained model
+    - "train_on_upload"   -> train a model on the upload (needs target)
+    - "block"             -> too different + no target
+    """
+    cols = set(upload_df.columns)
+    training_cols = set(training_feature_cols)
 
-    Robust to:
-    - missing columns (fills them with NaN so the imputers use training defaults)
-    - extra columns (kept for LLM context but ignored by the model)
+    match_count = len(cols.intersection(training_cols))
+    match_ratio = match_count / max(1, len(training_cols))
+
+    has_core = all(c in cols for c in CORE_SIGNALS)
+    has_target = target in cols
+
+    # Safety thresholds (tune later)
+    if match_ratio >= 0.40 and has_core:
+        return "pretrained"
+
+    if has_target:
+        return "train_on_upload"
+
+    return "block"
+
+
+def score_dataset_aligned(df: pd.DataFrame, model, feature_cols: list[str]) -> pd.DataFrame:
+    """
+    Score an uploaded dataset using the pre-trained model, safely aligned:
+    - missing training cols -> NaN (imputers handle)
+    - extra cols -> ignored
     """
     df = df.copy()
-    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+    df = normalize_cols(df)
 
-    # Build X with EXACTLY the same columns and order used in training
     X = pd.DataFrame(index=df.index)
     missing_cols = []
     for col in feature_cols:
         if col in df.columns:
             X[col] = df[col]
         else:
-            # column was present during training but is missing now
-            # we create it filled with NaN; imputers will replace with training defaults
             X[col] = np.nan
             missing_cols.append(col)
 
-    # Nice-to-have: tell the user what’s going on
-    if missing_cols:
-        st.warning(
-            f"Uploaded data is missing {len(missing_cols)} feature columns that the model was trained on. "
-            "Those columns will use training defaults during scoring. "
-            f"Examples: {', '.join(missing_cols[:8])}"
-            + (" ..." if len(missing_cols) > 8 else "")
-        )
-
-    extra_cols = [c for c in df.columns if c not in feature_cols + ["churn_flag", "predicted_churn_proba", "risk_band"]]
-    if extra_cols:
-        st.info(
-            f"Uploaded data includes {len(extra_cols)} extra columns the model does not use. "
-            f"Examples: {', '.join(extra_cols[:8])}"
-            + (" ..." if len(extra_cols) > 8 else "")
-        )
-
-    # Predict churn probabilities
-    try:
-        proba = model.predict_proba(X)[:, 1]
-    except Exception as e:
-        st.error(f"Could not score the uploaded dataset with the trained model. Details: {e}")
-        raise
-
+    proba = model.predict_proba(X)[:, 1]
     df["predicted_churn_proba"] = proba
 
-    # Create 4 risk bands: Low / Medium / High / Very high
+    # risk bands
     try:
         df["risk_band"] = pd.qcut(
             df["predicted_churn_proba"],
@@ -168,33 +286,14 @@ def score_dataset(df: pd.DataFrame, model, feature_cols):
     return df
 
 
-
-def build_context(scored_df: pd.DataFrame):
-    ctx = {}
-
-    if "predicted_churn_proba" not in scored_df.columns:
-        return ctx
-
-    probas = scored_df["predicted_churn_proba"]
-
-    ctx["avg_risk"] = float(np.nanmean(probas))
-    ctx["p90_risk"] = float(np.nanpercentile(probas, 90))
-    ctx["top_risk_count"] = int((probas >= np.nanpercentile(probas, 90)).sum())
-    ctx["n_customers"] = len(scored_df)
-
-    if "risk_band" in scored_df.columns:
-        seg_summary = (
-            scored_df.groupby("risk_band", dropna=False)["predicted_churn_proba"]
-            .agg(["count", "mean"])
-            .reset_index()
-            .rename(columns={"count": "customers", "mean": "avg_churn_risk"})
-            .sort_values("avg_churn_risk", ascending=False)
-        )
-        ctx["segment_summary"] = seg_summary
-    else:
-        ctx["segment_summary"] = None
-
-    return ctx
+def train_on_upload_and_score(df: pd.DataFrame, target: str = TARGET_DEFAULT):
+    """
+    Train a model on the uploaded dataset itself (requires target),
+    then score the same dataset.
+    """
+    model, feature_cols = train_churn_model(df, target=target)
+    scored = score_dataset_aligned(df, model, feature_cols)
+    return scored, model, feature_cols
 
 
 def detect_intent(text: str) -> str:
