@@ -619,15 +619,34 @@ ctx = {}
 if uploaded_file is not None:
     raw_bytes = uploaded_file.read()
     uploaded_df = pd.read_csv(io.BytesIO(raw_bytes))
-    uploaded_df.columns = [c.strip().lower().replace(" ", "_") for c in uploaded_df.columns]
 
-    scored_df = score_dataset(uploaded_df, model, feature_cols)
+    # NEW: clean + synonym rename
+    uploaded_df = clean_df(uploaded_df)
+    uploaded_df = apply_synonym_renames(uploaded_df)
+
+    # NEW: decide how to run
+    mode = decide_mode(uploaded_df, feature_cols, target=TARGET_DEFAULT)
+
+    if mode == "pretrained":
+        scored_df = score_dataset_aligned(uploaded_df, model, feature_cols)
+        st.sidebar.success("Mode: Pretrained scoring on your upload.")
+
+    elif mode == "train_on_upload":
+        scored_df, _, _ = train_on_upload_and_score(uploaded_df, target=TARGET_DEFAULT)
+        st.sidebar.success("Mode: Train-on-upload (trained on your data).")
+
+    else:
+        st.sidebar.error(
+            "Dataset doesn’t match the model schema and no churn/target column was found. "
+            "Add a churn column (e.g., churn_flag) or upload a telco dataset closer to the template."
+        )
+        st.stop()
+
     ctx = build_context(scored_df)
 
-    st.sidebar.success("Using uploaded data for analysis.")
 else:
     st.sidebar.info("No dataset uploaded yet. Please upload a CSV to continue.")
-
+    st.stop()
 
 # ------------------------------------------------
 # Main layout – tabs
