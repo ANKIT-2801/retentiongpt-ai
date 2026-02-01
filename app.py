@@ -51,6 +51,16 @@ SYNONYMS = {
 
 CORE_SIGNALS = {"tenure_months", "monthly_charge"}  # keep small + realistic
 
+# These columns (business concepts) MUST exist (after synonym renaming) or we refuse to interpret.
+REQUIRED_INTERPRET_COLS = {
+    "customer_id",
+    "tenure_months",
+    "contract",
+    "monthly_charge",
+    "paymentmethod",
+}
+
+
 
 def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -620,11 +630,28 @@ if uploaded_file is not None:
     raw_bytes = uploaded_file.read()
     uploaded_df = pd.read_csv(io.BytesIO(raw_bytes))
 
-    # NEW: clean + synonym rename
+    # Clean + synonym rename (standardize columns early)
     uploaded_df = clean_df(uploaded_df)
     uploaded_df = apply_synonym_renames(uploaded_df)
 
-    # NEW: decide how to run
+    # HARD GATE: required interpretation columns must exist after synonym renaming
+    missing = [c for c in REQUIRED_INTERPRET_COLS if c not in uploaded_df.columns]
+    if missing:
+        st.sidebar.error(
+            "Can’t run interpretation. Your upload is missing these required business columns "
+            f"(after synonym matching): {', '.join(missing)}"
+        )
+        st.sidebar.info(
+            "Fix: rename columns so they match common names. Examples:\n"
+            "- customer_id / account_id\n"
+            "- tenure / tenure_months\n"
+            "- contract / contract_type / plan_type\n"
+            "- mrc / monthly_charge / monthlycharges\n"
+            "- payment_method / billing_method"
+        )
+        st.stop()
+
+    # Decide how to run (pretrained scoring vs train-on-upload)
     mode = decide_mode(uploaded_df, feature_cols, target=TARGET_DEFAULT)
 
     if mode == "pretrained":
@@ -638,7 +665,7 @@ if uploaded_file is not None:
     else:
         st.sidebar.error(
             "Dataset doesn’t match the model schema and no churn/target column was found. "
-            "Add a churn column (e.g., churn_flag) or upload a telco dataset closer to the template."
+            "Add a churn column (e.g., churn_"
         )
         st.stop()
 
