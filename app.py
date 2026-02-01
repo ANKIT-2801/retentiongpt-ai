@@ -600,11 +600,12 @@ if uploaded_file is not None:
 
     # If churn_flag exists, train a fresh model on the uploaded dataset (uses ALL extra columns too)
     if "churn_flag" in uploaded_df.columns:
-        with st.spinner("Training model on uploaded dataset..."):
-    upload_model, upload_feature_cols = train_churn_model_uncached(uploaded_df)
+    with st.spinner("Training model on uploaded dataset..."):
+        upload_model, upload_feature_cols = train_churn_model_uncached(uploaded_df)
 
-        scored_df = score_dataset(uploaded_df, upload_model, upload_feature_cols)
-        st.sidebar.success("Using uploaded data (trained on your upload).")
+    scored_df = score_dataset(uploaded_df, upload_model, upload_feature_cols)
+    st.sidebar.success("Using uploaded data (trained on your upload).")
+
 
     # If churn_flag does not exist, we cannot train; score using base model
     else:
