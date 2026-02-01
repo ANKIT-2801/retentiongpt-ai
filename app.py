@@ -478,6 +478,50 @@ def ask_llm(question: str, ctx: dict, scored_df: pd.DataFrame):
     except Exception as e:
         st.warning(f"LLM call failed, falling back to rule-based assistant. Details: {e}")
         return None
+# ------------------------------------------------
+# Required business columns (must exist in upload)
+# ------------------------------------------------
+SYNONYMS = {
+    "customer_id": ["customer_id", "cust_id", "account_id", "subscriber_id", "user_id", "id"],
+    "tenure_months": ["tenure", "tenure_months", "months_active", "months_with_company", "customer_tenure"],
+    "contract": ["contract", "contract_type", "plan_type", "plan", "term", "agreement_term"],
+    "monthly_charge": ["monthly_charge", "monthlycharges", "mrc", "monthly_fee", "monthly_amount", "monthlycost"],
+    "paymentmethod": ["paymentmethod", "payment_method", "billing_method", "payment_mode", "pay_method", "payment_type"],
+}
+
+REQUIRED_MAIN_COLS = ["customer_id", "tenure_months", "contract", "monthly_charge", "paymentmethod"]
+
+
+def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+    return df
+
+
+def apply_synonym_renames(df: pd.DataFrame) -> pd.DataFrame:
+    """Rename columns to canonical names using SYNONYMS."""
+    df = df.copy()
+    colset = set(df.columns)
+
+    rename_map = {}
+    for canonical, variants in SYNONYMS.items():
+        if canonical in colset:
+            continue
+        for v in variants:
+            if v in colset:
+                rename_map[v] = canonical
+                break
+
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    return df
+
+
+def validate_required_columns(df: pd.DataFrame) -> list:
+    """Return missing required columns (canonical names)."""
+    missing = [c for c in REQUIRED_MAIN_COLS if c not in df.columns]
+    return missing
 
 
 # ------------------------------------------------
@@ -502,9 +546,38 @@ uploaded_file = st.sidebar.file_uploader("Upload new customer data (CSV)", type=
 if uploaded_file is not None:
     raw_bytes = uploaded_file.read()
     uploaded_df = pd.read_csv(io.BytesIO(raw_bytes))
-    uploaded_df.columns = [c.strip().lower().replace(" ", "_") for c in uploaded_df.columns]
-    scored_df = score_dataset(uploaded_df, model, feature_cols)
-    st.sidebar.success("Using uploaded data for analysis.")
+
+    # Normalize + rename columns to canonical required names
+    uploaded_df = normalize_cols(uploaded_df)
+    uploaded_df = apply_synonym_renames(uploaded_df)
+
+    # HARD GATE: required 5 business columns must exist
+    missing_required = validate_required_columns(uploaded_df)
+    if missing_required:
+        st.sidebar.error(
+            "Required columns are not present. Missing: " + ", ".join(missing_required)
+        )
+        st.sidebar.info(
+            "Your dataset must include these concepts (names can vary):\n"
+            "- customer_id / account_id\n"
+            "- tenure / tenure_months\n"
+            "- contract / contract_type / plan_type\n"
+            "- monthly_charge / monthlycharges / mrc\n"
+            "- paymentmethod / payment_method / billing_method"
+        )
+        st.stop()
+
+    # If churn_flag exists, train a fresh model on the uploaded dataset (uses ALL extra columns too)
+    if "churn_flag" in uploaded_df.columns:
+        upload_model, upload_feature_cols = train_churn_model(uploaded_df)
+        scored_df = score_dataset(uploaded_df, upload_model, upload_feature_cols)
+        st.sidebar.success("Using uploaded data (trained on your upload).")
+
+    # If churn_flag does not exist, we cannot train; score using base model
+    else:
+        scored_df = score_dataset(uploaded_df, model, feature_cols)
+        st.sidebar.success("Using uploaded data (scored with base model – no churn_flag to train).")
+
 else:
     scored_df = score_dataset(base_df, model, feature_cols)
     st.sidebar.info("Using default training data.")
