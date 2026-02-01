@@ -100,6 +100,37 @@ def train_churn_model(df: pd.DataFrame):
     model.fit(X, y)
 
     return model, X.columns.tolist()
+def train_churn_model_uncached(df: pd.DataFrame):
+    """Same as train_churn_model, but without Streamlit caching (for uploaded files)."""
+    X, y, num_cols, cat_cols = split_features_target(df)
+
+    numeric_transformer = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler())
+    ])
+
+    categorical_transformer = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore"))
+    ])
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("num", numeric_transformer, num_cols),
+            ("cat", categorical_transformer, cat_cols),
+        ]
+    )
+
+    clf = LogisticRegression(max_iter=500)
+
+    model = Pipeline(steps=[
+        ("prep", preprocessor),
+        ("clf", clf),
+    ])
+
+    model.fit(X, y)
+
+    return model, X.columns.tolist()
 
 
 def score_dataset(df: pd.DataFrame, model, feature_cols):
