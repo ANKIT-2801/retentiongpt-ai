@@ -11,7 +11,8 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 
-from openai import OpenAI
+from groq import Groq
+
 
 # ------------------------------------------------
 # Basic page config
@@ -319,14 +320,10 @@ def assistant_response(question: str, intent: str, ctx: dict) -> str:
 
 @st.cache_resource(show_spinner=False)
 def get_llm_client():
-    """Create an OpenRouter client using the API key from Streamlit secrets."""
-    api_key = st.secrets.get("OPENROUTER_API_KEY")
+    api_key = st.secrets.get("GROQ_API_KEY")
     if not api_key:
         return None
-    client = OpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=api_key,
-    )
+    return Groq(api_key=api_key)
     return client
 
 
@@ -425,7 +422,6 @@ def make_context_text(ctx: dict, scored_df: pd.DataFrame, max_rows: int = 5, max
 
 
 def ask_llm(question: str, ctx: dict, scored_df: pd.DataFrame):
-    """Ask the LLM for an answer, using churn context. Returns None if LLM not available."""
     client = get_llm_client()
     if client is None:
         return None
@@ -434,7 +430,7 @@ def ask_llm(question: str, ctx: dict, scored_df: pd.DataFrame):
 
     try:
         completion = client.chat.completions.create(
-            model="openrouter/auto",
+            model="llama3-70b-8192",
             messages=[
                 {
                     "role": "system",
@@ -454,13 +450,16 @@ def ask_llm(question: str, ctx: dict, scored_df: pd.DataFrame):
                     ),
                 },
             ],
-            max_tokens=450,
             temperature=0.4,
+            max_tokens=450,
         )
+
         return completion.choices[0].message.content.strip()
+
     except Exception as e:
-        st.warning(f"LLM call failed, falling back to rule-based assistant. Details: {e}")
+        st.warning(f"GROQ call failed, falling back to rule-based assistant. Details: {e}")
         return None
+
 
 
 # ------------------------------------------------
