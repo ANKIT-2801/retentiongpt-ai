@@ -151,14 +151,14 @@ def score_dataset(df: pd.DataFrame, model, feature_cols):
     try:
         df["risk_band"] = pd.qcut(
             df["predicted_churn_proba"],
-            q=4,
-            labels=["Low risk", "Medium risk", "High risk", "Very high risk"]
+            q=3,
+            labels=["Low risk", "Medium risk", "High risk"]
         )
     except ValueError:
         df["risk_band"] = pd.cut(
             df["predicted_churn_proba"],
-            bins=[-0.01, 0.25, 0.5, 0.75, 1.0],
-            labels=["Low risk", "Medium risk", "High risk", "Very high risk"]
+            bins=[-0.01, 0.33, 0.66, 1.0],
+            labels=["Low risk", "Medium risk", "High risk"]
         )
 
     return df
