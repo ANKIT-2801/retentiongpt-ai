@@ -5,7 +5,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 
-from sklearn.model_selection import train_test_split
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
@@ -120,15 +119,12 @@ def score_dataset(df: pd.DataFrame, model, feature_cols):
         if col in df.columns:
             X[col] = df[col]
         else:
-            # column was present during training but is missing now
-            # we create it filled with NaN; imputers will replace with training defaults
             X[col] = np.nan
             missing_cols.append(col)
 
-    # Nice-to-have: tell the user what’s going on
     if missing_cols:
         st.warning(
-            f"Uploaded data is missing {len(missing_cols)} feature columns that the model was trained on. "
+            f"Uploaded data is missing {len(missing_cols)} feature columns the model was trained on. "
             "Those columns will use training defaults during scoring. "
             f"Examples: {', '.join(missing_cols[:8])}"
             + (" ..." if len(missing_cols) > 8 else "")
@@ -142,7 +138,6 @@ def score_dataset(df: pd.DataFrame, model, feature_cols):
             + (" ..." if len(extra_cols) > 8 else "")
         )
 
-    # Predict churn probabilities
     try:
         proba = model.predict_proba(X)[:, 1]
     except Exception as e:
@@ -166,7 +161,6 @@ def score_dataset(df: pd.DataFrame, model, feature_cols):
         )
 
     return df
-
 
 
 def build_context(scored_df: pd.DataFrame):
@@ -351,7 +345,6 @@ def make_context_text(ctx: dict, scored_df: pd.DataFrame, max_rows: int = 5, max
     p90_risk = ctx.get("p90_risk")
     seg_summary = ctx.get("segment_summary")
 
-    # Overall churn picture
     if n:
         lines.append(f"Total customers analysed: {n}")
     if avg_risk is not None:
@@ -359,7 +352,6 @@ def make_context_text(ctx: dict, scored_df: pd.DataFrame, max_rows: int = 5, max
     if p90_risk is not None:
         lines.append(f"Top 10% churn risk threshold: {p90_risk:.3f}")
 
-    # Risk band summary
     if seg_summary is not None and not seg_summary.empty:
         lines.append("\nRisk band summary (band, customers, avg_churn_risk):")
         for _, row in seg_summary.iterrows():
@@ -367,27 +359,22 @@ def make_context_text(ctx: dict, scored_df: pd.DataFrame, max_rows: int = 5, max
                 f"- {row['risk_band']}: {int(row['customers'])} customers, avg risk {row['avg_churn_risk']:.3f}"
             )
 
-    # Prepare for column profiling
     df = scored_df.copy()
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
 
-    # Identify very high risk subset (if available)
     vh = None
     if "risk_band" in df.columns:
         vh = df[df["risk_band"] == "Very high risk"].copy()
 
-    # Work out numeric vs categorical columns
     ignore_cols = {"predicted_churn_proba", "risk_band"}
     all_cols = [c for c in df.columns if c not in ignore_cols]
 
     numeric_cols = df[all_cols].select_dtypes(include=[np.number]).columns.tolist()
     cat_cols = [c for c in all_cols if c not in numeric_cols]
 
-    # Limit how many columns we dump into the prompt
     numeric_cols = numeric_cols[: max_cols]
     cat_cols = cat_cols[: max_cols]
 
-    # --- Numeric column profiles ---
     if numeric_cols:
         lines.append("\nNumeric feature profiles (overall, and very high risk if available):")
         for col in numeric_cols:
@@ -407,11 +394,9 @@ def make_context_text(ctx: dict, scored_df: pd.DataFrame, max_rows: int = 5, max
 
             lines.append(line)
 
-    # --- Categorical column profiles ---
     if cat_cols:
         lines.append("\nCategorical feature profiles (top categories overall and in very high risk):")
         for col in cat_cols:
-            # Skip columns with too many unique values (IDs etc.)
             if df[col].nunique(dropna=True) > 20:
                 continue
 
@@ -430,7 +415,6 @@ def make_context_text(ctx: dict, scored_df: pd.DataFrame, max_rows: int = 5, max
                     for val, frac in vc_vh.items():
                         lines.append(f"- {val}: {frac * 100:.1f}% of very high risk customers")
 
-    # Add a small raw sample for grounding
     sample_cols = [c for c in ["customer_id", "risk_band", "predicted_churn_proba"] if c in df.columns]
     if sample_cols:
         sample = df[sample_cols].head(max_rows)
@@ -438,7 +422,6 @@ def make_context_text(ctx: dict, scored_df: pd.DataFrame, max_rows: int = 5, max
         lines.append(sample.to_string(index=False))
 
     return "\n".join(lines)
-
 
 
 def ask_llm(question: str, ctx: dict, scored_df: pd.DataFrame):
@@ -482,6 +465,7 @@ def ask_llm(question: str, ctx: dict, scored_df: pd.DataFrame):
 
 # ------------------------------------------------
 # Load base training data and train the model
+# (Still happens at startup, but NOTHING is displayed/scored until user uploads data.)
 # ------------------------------------------------
 if not file_exists(TRAIN_PATH):
     st.error(f"Training file not found at `{TRAIN_PATH}`. Please add final_data.csv to the data/ folder.")
@@ -491,24 +475,30 @@ base_df = load_training_data(TRAIN_PATH)
 model, feature_cols = train_churn_model(base_df)
 
 # ------------------------------------------------
-# Sidebar – upload new data
+# Upload-first gate (NO default dataset display)
 # ------------------------------------------------
-st.sidebar.header("Data settings")
-st.sidebar.write("By default, the assistant uses the built-in training data.")
-st.sidebar.write("You can optionally upload a new telco CSV with the same columns to score a fresh dataset.")
+st.sidebar.header("Upload (required)")
+st.sidebar.write("Upload a customer CSV to start. The app won’t show any dataset until you upload one.")
 
-uploaded_file = st.sidebar.file_uploader("Upload new customer data (CSV)", type=["csv"])
+uploaded_file = st.sidebar.file_uploader("Upload customer data (CSV)", type=["csv"])
 
-if uploaded_file is not None:
-    raw_bytes = uploaded_file.read()
-    uploaded_df = pd.read_csv(io.BytesIO(raw_bytes))
-    uploaded_df.columns = [c.strip().lower().replace(" ", "_") for c in uploaded_df.columns]
-    scored_df = score_dataset(uploaded_df, model, feature_cols)
-    st.sidebar.success("Using uploaded data for analysis.")
-else:
-    scored_df = score_dataset(base_df, model, feature_cols)
-    st.sidebar.info("Using default training data.")
+if uploaded_file is None:
+    st.info("Upload a CSV from the left sidebar to begin scoring and analysis.")
+    st.stop()
 
+# Read uploaded file
+raw_bytes = uploaded_file.read()
+uploaded_df = pd.read_csv(io.BytesIO(raw_bytes))
+uploaded_df.columns = [c.strip().lower().replace(" ", "_") for c in uploaded_df.columns]
+
+# Reset chat when a new file is uploaded (prevents mixing context)
+file_fingerprint = f"{getattr(uploaded_file, 'name', 'uploaded.csv')}::{len(raw_bytes)}"
+if st.session_state.get("last_uploaded_file") != file_fingerprint:
+    st.session_state["last_uploaded_file"] = file_fingerprint
+    st.session_state["messages"] = []
+
+# Score uploaded data
+scored_df = score_dataset(uploaded_df, model, feature_cols)
 ctx = build_context(scored_df)
 
 # ------------------------------------------------
@@ -530,13 +520,11 @@ with tab_chat:
     if user_q:
         st.session_state.messages.append({"role": "user", "content": user_q})
 
-        # 1) Try LLM answer
         llm_reply = ask_llm(user_q, ctx, scored_df)
 
         if llm_reply:
             reply = llm_reply
         else:
-            # 2) Fallback to rule-based answer if LLM not available
             intent = detect_intent(user_q)
             reply = assistant_response(user_q, intent, ctx)
 
@@ -577,19 +565,18 @@ with tab_how:
    The app loads `data/final_data.csv` and trains a Logistic Regression churn model in scikit-learn.  
    It treats `churn_flag` as the target and uses the remaining columns as features (after dropping IDs and any existing prediction columns).
 
-2. **Scoring & segmentation**  
-   The trained model scores each customer and creates a `predicted_churn_proba` column.  
+2. **Upload-first behaviour**  
+   The app does **not** display or score the built-in dataset.  
+   It waits for the user to upload a CSV. Only after upload will scoring, segmentation, and chat become available.
+
+3. **Scoring & segmentation**  
+   The trained model scores each uploaded customer and creates a `predicted_churn_proba` column.  
    Customers are grouped into four named risk bands: **Low**, **Medium**, **High**, and **Very high risk**.
 
-3. **LLM assistant**  
-   The assistant summarises the churn outputs (risk bands, average risk, top 10%, sample rows) and sends that to an OpenRouter LLM.  
-   The LLM responds like a senior retention analyst.  
+4. **LLM assistant**  
+   The assistant summarises churn outputs (risk bands, averages, top 10%, sample rows) and sends that to an OpenRouter LLM.  
    If the LLM isn’t available, a rule-based backup still gives reasonable answers.
 
-4. **Uploading new data**  
-   You can upload a new cleaned telco CSV in the sidebar.  
-   The model scores that dataset on the fly, and the assistant’s answers are based on that new file.
-
-This gives you a full story for your project: data → model → scoring → AI retention copilot.
+This gives you a clean story: train → upload → score → segment → retention copilot.
 """
     )
