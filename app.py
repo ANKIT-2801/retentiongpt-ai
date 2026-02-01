@@ -6,8 +6,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 
-import joblib
-
 from sklearn.model_selection import train_test_split
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
@@ -32,114 +30,151 @@ st.caption("Upload a telco dataset, score customers, and ask an AI assistant for
 DATA_DIR = "data"
 TRAIN_PATH = os.path.join(DATA_DIR, "final_data.csv")
 
-MODEL_DIR = "models"
-MODEL_PATH = os.path.join(MODEL_DIR, "telco_churn_model.joblib")
-
 TARGET_DEFAULT = "churn_flag"
 
 # ------------------------------------------------
 # Column helpers / cleaning
 # ------------------------------------------------
-def normalize_colname(c: str) -> str:
-    c = c.strip()
-    c = re.sub(r"\s+", "_", c)
-    c = re.sub(r"[^\w_]", "", c)
-    return c.lower()
+MISSING_TOKENS = {"", " ", "na", "n/a", "null", "none", "-", "--", "nan"}
+
+# Common “core” business concepts we try to detect (by name first)
+SYNONYMS = {
+    "tenure_months": ["tenure", "tenure_months", "months_active", "customer_tenure", "months_with_company"],
+    "monthly_charge": ["monthly_charge", "monthlycharges", "mrc", "monthly_fee", "monthlyamount", "monthlycost"],
+    "total_charge": ["total_charge", "totalcharges", "lifetime_charge", "totalamount", "total_billed"],
+    "contract": ["contract", "contract_type", "plan_contract"],
+    "paymentmethod": ["paymentmethod", "payment_method", "pay_method", "payment_type"],
+    "internetservice": ["internetservice", "internet_service", "net_service", "broadband"],
+    "customer_id": ["customer_id", "cust_id", "subscriber_id", "account_id", "id"],
+    TARGET_DEFAULT: ["churn", "churn_flag", "is_churn", "churned", "target"],
+}
+
+CORE_SIGNALS = {"tenure_months", "monthly_charge"}  # keep small + realistic
 
 
-def normalize_df_columns(df: pd.DataFrame) -> pd.DataFrame:
+def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df.columns = [normalize_colname(c) for c in df.columns]
+    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
     return df
 
 
-def standardize_missing_tokens(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    missing_tokens = {"", "na", "n/a", "nan", "null", "none", "?", "unknown"}
+def _looks_like_money(series: pd.Series) -> bool:
+    if series.dtype != "object":
+        return False
+    s = series.dropna().astype(str).head(50)
+    if s.empty:
+        return False
+    # If many values contain $ or commas or look numeric-ish with decimals
+    moneyish = s.str.contains(r"[$,]") | s.str.match(r"^\s*\d+(\.\d+)?\s*$")
+    return float(moneyish.mean()) > 0.7
+
+
+def _to_number_safe(series: pd.Series) -> pd.Series:
+    # strip $, commas
+    s = series.astype(str).str.replace(",", "", regex=False).str.replace("$", "", regex=False).str.strip()
+    return pd.to_numeric(s, errors="coerce")
+
+
+def _to_bool01(series: pd.Series) -> pd.Series:
+    s = series.astype(str).str.strip().str.lower()
+    true_set = {"yes", "y", "true", "1", "t"}
+    false_set = {"no", "n", "false", "0", "f"}
+    out = pd.Series(np.nan, index=series.index)
+    out[s.isin(true_set)] = 1
+    out[s.isin(false_set)] = 0
+    return out
+
+
+def clean_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Production-friendly cleaning:
+    - normalize column names
+    - normalize missing tokens to NaN
+    - convert yes/no columns to 0/1 where appropriate
+    - convert money-ish strings to numeric
+    - drop ID-like columns (too many unique values)
+    """
+    df = normalize_cols(df)
+
+    # normalize missing tokens
     for c in df.columns:
-        if df[c].dtype == object:
+        if df[c].dtype == "object":
             df[c] = df[c].astype(str).str.strip()
-            df[c] = df[c].replace({t: np.nan for t in missing_tokens})
-    return df
+            df.loc[df[c].str.lower().isin(MISSING_TOKENS), c] = np.nan
 
-
-def yes_no_to_binary(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    mapping = {
-        "yes": 1, "y": 1, "true": 1, "t": 1,
-        "no": 0, "n": 0, "false": 0, "f": 0
-    }
+    # convert yes/no-like columns
     for c in df.columns:
-        if df[c].dtype == object:
-            s = df[c].astype(str).str.lower().str.strip()
-            uniq = set(s.dropna().unique().tolist())
-            if uniq and uniq.issubset(set(mapping.keys())):
-                df[c] = s.map(mapping).astype("float")
-    return df
-
-
-def money_like_to_numeric(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    for c in df.columns:
-        if df[c].dtype == object:
-            s = df[c].astype(str)
-            # detect if column looks like money/number with $ or commas
-            sample = s.dropna().head(50)
-            if len(sample) == 0:
+        if df[c].dtype == "object":
+            s = df[c].dropna().astype(str).str.lower()
+            if s.empty:
                 continue
-            looks_money = sample.str.contains(r"[\$,\d]", regex=True).mean() > 0.6
-            if looks_money:
-                cleaned = (
-                    s.str.replace(r"[\$,]", "", regex=True)
-                     .str.replace(r"\s+", "", regex=True)
-                )
-                # coercing to numeric can create many NaNs; only keep if it converts decently
-                numeric = pd.to_numeric(cleaned, errors="coerce")
-                if numeric.notna().mean() > 0.5:
-                    df[c] = numeric
-    return df
+            # if most values are yes/no style
+            if float(s.isin({"yes", "no", "true", "false", "y", "n", "0", "1", "t", "f"}).mean()) > 0.85:
+                df[c] = _to_bool01(df[c])
 
-
-def drop_high_cardinality_strings(df: pd.DataFrame, threshold: int = 200) -> pd.DataFrame:
-    df = df.copy()
-    drop_cols = []
+    # convert money-ish strings
     for c in df.columns:
-        if df[c].dtype == object:
-            nunique = df[c].nunique(dropna=True)
-            if nunique > threshold:
-                drop_cols.append(c)
-    if drop_cols:
-        df = df.drop(columns=drop_cols)
+        if _looks_like_money(df[c]):
+            df[c] = _to_number_safe(df[c])
+
+    # drop obvious ID-like columns (high-cardinality strings)
+    # keep customer_id if present; we'll treat it as special later
+    for c in list(df.columns):
+        if c == "customer_id":
+            continue
+        if df[c].dtype == "object":
+            nun = df[c].nunique(dropna=True)
+            if nun > max(50, int(0.8 * len(df))):  # very high uniqueness
+                df.drop(columns=[c], inplace=True)
+
     return df
 
 
-def basic_clean(df: pd.DataFrame) -> pd.DataFrame:
-    df = normalize_df_columns(df)
-    df = standardize_missing_tokens(df)
-    df = yes_no_to_binary(df)
-    df = money_like_to_numeric(df)
-    df = drop_high_cardinality_strings(df)
-    return df
+# ------------------------------------------------
+# Schema / matching helpers
+# ------------------------------------------------
+def _best_match(col: str, candidates: list[str]) -> bool:
+    col_clean = re.sub(r"[^a-z0-9_]", "", col.lower())
+    for cand in candidates:
+        cand_clean = re.sub(r"[^a-z0-9_]", "", cand.lower())
+        if col_clean == cand_clean:
+            return True
+    return False
 
 
-def file_exists(path: str) -> bool:
-    return os.path.exists(path) and os.path.isfile(path)
-
-
-def load_training_data(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    df = basic_clean(df)
+def apply_synonym_renames(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Rename uploaded columns to our internal standard where we can.
+    No UI. Name-based only.
+    """
+    df = normalize_cols(df)
+    rename_map = {}
+    for internal_name, name_list in SYNONYMS.items():
+        for c in df.columns:
+            if _best_match(c, name_list):
+                rename_map[c] = internal_name
+                break
+    if rename_map:
+        df = df.rename(columns=rename_map)
     return df
 
 
 def split_features_target(df: pd.DataFrame, target: str = TARGET_DEFAULT):
-    df = df.copy()
     if target not in df.columns:
-        raise ValueError(f"Target column '{target}' not found in training data.")
+        raise ValueError(f"Dataset must contain a '{target}' column for training.")
+
     y = df[target].astype(int)
 
-    # drop noisy / non-feature columns if present
-    drop_cols = [target]
+    drop_cols = [
+        target,
+        "predicted_churn_proba",
+        "predicted_ltv",
+        "predicted_remaining_months",
+        "risk_band",
+        "segment_id",
+        "cluster",
+        "customer_id",
+    ]
     drop_cols = [c for c in drop_cols if c in df.columns]
 
     X = df.drop(columns=drop_cols)
@@ -195,134 +230,364 @@ def decide_mode(upload_df: pd.DataFrame, training_feature_cols: list[str], targe
     - "block"             -> too different + no target
     """
     cols = set(upload_df.columns)
-    train_cols = set(training_feature_cols)
+    training_cols = set(training_feature_cols)
 
+    match_count = len(cols.intersection(training_cols))
+    match_ratio = match_count / max(1, len(training_cols))
+
+    has_core = all(c in cols for c in CORE_SIGNALS)
     has_target = target in cols
-    overlap = len(cols.intersection(train_cols)) / max(1, len(train_cols))
+
+    # Safety thresholds (tune later)
+    if match_ratio >= 0.40 and has_core:
+        return "pretrained"
 
     if has_target:
         return "train_on_upload"
-    if overlap >= 0.30:
-        return "pretrained"
+
     return "block"
 
 
-def align_schema_for_model(df: pd.DataFrame, expected_cols: list[str]) -> pd.DataFrame:
+def score_dataset_aligned(df: pd.DataFrame, model, feature_cols: list[str]) -> pd.DataFrame:
     """
-    Build a dataframe with exactly the columns expected by the model.
-    Extra columns are ignored. Missing columns are created as NaN.
+    Score an uploaded dataset using the pre-trained model, safely aligned:
+    - missing training cols -> NaN (imputers handle)
+    - extra cols -> ignored
     """
     df = df.copy()
-    aligned = pd.DataFrame(index=df.index)
-    for c in expected_cols:
-        if c in df.columns:
-            aligned[c] = df[c]
+    df = normalize_cols(df)
+
+    X = pd.DataFrame(index=df.index)
+    missing_cols = []
+    for col in feature_cols:
+        if col in df.columns:
+            X[col] = df[col]
         else:
-            aligned[c] = np.nan
-    return aligned
-
-
-def score_with_model(model, df: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
-    df = df.copy()
-    X = align_schema_for_model(df, feature_cols)
+            X[col] = np.nan
+            missing_cols.append(col)
 
     proba = model.predict_proba(X)[:, 1]
     df["predicted_churn_proba"] = proba
-    return df
 
-
-def assign_risk_bands(df: pd.DataFrame, proba_col: str = "predicted_churn_proba") -> pd.DataFrame:
-    df = df.copy()
+    # risk bands
     try:
         df["risk_band"] = pd.qcut(
-            df[proba_col],
+            df["predicted_churn_proba"],
             q=4,
-            labels=["Low", "Medium", "High", "Very High"]
+            labels=["Low risk", "Medium risk", "High risk", "Very high risk"]
         )
-    except Exception:
+    except ValueError:
         df["risk_band"] = pd.cut(
-            df[proba_col],
-            bins=[-0.001, 0.25, 0.50, 0.75, 1.001],
-            labels=["Low", "Medium", "High", "Very High"]
+            df["predicted_churn_proba"],
+            bins=[-0.01, 0.25, 0.5, 0.75, 1.0],
+            labels=["Low risk", "Medium risk", "High risk", "Very high risk"]
         )
+
     return df
 
 
-def compute_summary(df: pd.DataFrame) -> dict:
-    proba = df["predicted_churn_proba"]
-    return {
-        "total_customers": int(len(df)),
-        "avg_risk": float(proba.mean()) if len(proba) else 0.0,
-        "top_10pct_threshold": float(proba.quantile(0.90)) if len(proba) else 0.0
-    }
-
-
-def build_context(scored_df: pd.DataFrame) -> str:
+def train_on_upload_and_score(df: pd.DataFrame, target: str = TARGET_DEFAULT):
     """
-    Build compact context for the LLM: distribution + top risk customers.
+    Train a model on the uploaded dataset itself (requires target),
+    then score the same dataset.
     """
-    if scored_df is None or scored_df.empty:
-        return "No data scored."
-
-    summary = compute_summary(scored_df)
-    band_counts = scored_df["risk_band"].value_counts(dropna=False).to_dict()
-
-    top = scored_df.sort_values("predicted_churn_proba", ascending=False).head(25)
-    top_rows = top.to_csv(index=False)
-
-    context = f"""
-You are a retention strategy assistant.
-
-Summary:
-- Total customers: {summary['total_customers']}
-- Average churn risk: {summary['avg_risk']:.3f}
-- Top 10% churn risk threshold: {summary['top_10pct_threshold']:.3f}
-
-Risk band counts:
-{band_counts}
-
-Top risky customers (sample):
-{top_rows}
-
-Now answer the user's question with concrete retention actions.
-"""
-    return context.strip()
+    model, feature_cols = train_churn_model(df, target=target)
+    scored = score_dataset_aligned(df, model, feature_cols)
+    return scored, model, feature_cols
 
 
-def init_openai_client():
+def detect_intent(text: str) -> str:
+    t = text.lower()
+    if any(k in t for k in ["why", "reason", "increase", "decrease", "driver", "cause"]):
+        return "churn_explain"
+    if any(k in t for k in ["segment", "cohort", "group", "prioritise", "prioritize", "which segment"]):
+        return "segment_strategy"
+    if any(k in t for k in ["experiment", "test", "a/b", "ab test", "hypothesis"]):
+        return "experiments"
+    if any(k in t for k in ["revenue", "ltv", "value", "at risk", "risk"]):
+        return "revenue"
+    return "general"
+
+
+def parse_rank(text: str) -> int:
+    """Detect '2nd', 'second', 'third' etc. Default is 1 (top segment)."""
+    t = text.lower()
+    if "second" in t or "2nd" in t:
+        return 2
+    if "third" in t or "3rd" in t:
+        return 3
+    if "fourth" in t or "4th" in t:
+        return 4
+    return 1
+
+
+def format_pct(x):
+    return f"{x * 100:.1f}%"
+
+
+def assistant_response(question: str, intent: str, ctx: dict) -> str:
+    """Rule-based backup assistant (used if LLM fails)."""
+    avg_risk = ctx.get("avg_risk")
+    p90_risk = ctx.get("p90_risk")
+    top_risk_count = ctx.get("top_risk_count")
+    n_customers = ctx.get("n_customers")
+    seg_summary = ctx.get("segment_summary")
+
+    if not ctx:
+        return "I wasn't able to build context from the data. Please check that the file has a 'churn_flag' column and re-run."
+
+    if intent == "revenue":
+        if avg_risk is None:
+            return "I can’t estimate revenue risk without churn scores, but the model should have created 'predicted_churn_proba'."
+        return (
+            f"In this dataset I see **{n_customers:,} customers**.\n\n"
+            f"- Average churn risk: **{format_pct(avg_risk)}**\n"
+            f"- Top 10% churn risk threshold: **{format_pct(p90_risk)}**\n"
+            f"- Customers in that top-risk bucket: **{top_risk_count:,}**\n\n"
+            "You’d normally multiply those probabilities by ARPU or LTV to estimate revenue at risk."
+        )
+
+    if intent == "segment_strategy":
+        if seg_summary is None or seg_summary.empty:
+            return "I couldn’t create risk bands. Once 'predicted_churn_proba' is available, I’ll group customers into Low / Medium / High / Very high risk segments."
+
+        rank = parse_rank(question)
+        if rank > len(seg_summary):
+            rank = len(seg_summary)
+
+        seg_row = seg_summary.iloc[rank - 1]
+        seg_name = str(seg_row["risk_band"])
+        avg_seg_risk = seg_row["avg_churn_risk"]
+        seg_customers = int(seg_row["customers"])
+
+        rank_label = {1: "highest", 2: "second-highest", 3: "third-highest"}.get(rank, f"{rank}th")
+
+        return (
+            f"The **{rank_label} risk segment** is **{seg_name}**.\n\n"
+            f"- Customers in this segment: **{seg_customers:,}**\n"
+            f"- Average churn risk: **{format_pct(avg_seg_risk)}**\n\n"
+            "Suggested focus:\n"
+            "1. Review this segment’s profile in your dashboard (tenure, plan, usage, support tickets).\n"
+            "2. Design targeted retention offers for this group.\n"
+            "3. Track churn over the next 30–60 days to see if the risk actually drops."
+        )
+
+    if intent == "experiments":
+        return (
+            "Here are three simple, data-driven experiments you can run based on churn scores:\n\n"
+            "1) **Top-risk outreach**\n"
+            "   - Target: Customers in the 'Very high risk' band.\n"
+            "   - Action: Proactive outreach (email/SMS/call) with a personalised retention offer.\n"
+            "   - KPI: 30-day churn rate vs a control group.\n\n"
+            "2) **Support experience upgrade**\n"
+            "   - Target: High-risk customers with recent support tickets.\n"
+            "   - Action: Fast-track queueing or follow-up calls to close open issues.\n"
+            "   - KPI: Ticket resolution time and churn rate.\n\n"
+            "3) **Usage reactivation nudges**\n"
+            "   - Target: Medium-risk customers whose usage has dropped.\n"
+            "   - Action: In-app tips, bonus data, or reminder campaigns.\n"
+            "   - KPI: change in usage and churn over 30–60 days."
+        )
+
+    if intent == "churn_explain":
+        lines = []
+        if avg_risk is not None:
+            lines.append(f"Across all customers, the average predicted churn risk is **{format_pct(avg_risk)}**.")
+            lines.append(f"The riskiest 10% of customers are above **{format_pct(p90_risk)}** churn probability.")
+        if seg_summary is not None and not seg_summary.empty:
+            top = seg_summary.iloc[0]
+            lines.append(
+                f"The most at-risk segment is **{top['risk_band']}** with "
+                f"**{format_pct(top['avg_churn_risk'])}** average churn risk "
+                f"across **{int(top['customers']):,} customers**."
+            )
+        lines.append(
+            "\nTo understand *why*, you’d typically look at:\n"
+            "- tenure (short vs long)\n"
+            "- contract type (month-to-month vs longer-term)\n"
+            "- billing method and payment issues\n"
+            "- product usage and support tickets"
+        )
+        return "\n\n".join(lines)
+
+    return (
+        "I’ve run a churn model on your data and grouped customers into risk bands.\n\n"
+        "You can ask things like:\n"
+        "- *Which segment should we prioritise?*\n"
+        "- *Who is in the second highest-risk segment?*\n"
+        "- *How much churn risk do we see overall?*\n"
+        "- *What experiments should we run to reduce churn?*"
+    )
+
+
+# ---------- LLM helpers (OpenRouter via OpenAI client) ----------
+
+@st.cache_resource(show_spinner=False)
+def get_llm_client():
+    """Create an OpenRouter client using the API key from Streamlit secrets."""
+    api_key = st.secrets.get("OPENROUTER_API_KEY")
+    if not api_key:
+        return None
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=api_key,
+    )
+    return client
+
+
+def make_context_text(ctx: dict, scored_df: pd.DataFrame, max_rows: int = 5, max_cols: int = 12) -> str:
+    """
+    Turn model outputs into a richer text summary for the LLM.
+
+    It automatically profiles ALL columns:
+    - numeric columns: mean, min, max overall and (if available) in very high risk
+    - categorical columns: top categories overall and in very high risk
+    """
+    lines = []
+
+    n = ctx.get("n_customers")
+    avg_risk = ctx.get("avg_risk")
+    p90_risk = ctx.get("p90_risk")
+    seg_summary = ctx.get("segment_summary")
+
+    # Overall churn picture
+    if n:
+        lines.append(f"Total customers analysed: {n}")
+    if avg_risk is not None:
+        lines.append(f"Average predicted churn risk (all customers): {avg_risk:.3f}")
+    if p90_risk is not None:
+        lines.append(f"Top 10% churn risk threshold: {p90_risk:.3f}")
+
+    # Risk band summary
+    if seg_summary is not None and not seg_summary.empty:
+        lines.append("\nRisk band summary (band, customers, avg_churn_risk):")
+        for _, row in seg_summary.iterrows():
+            lines.append(
+                f"- {row['risk_band']}: {int(row['customers'])} customers, avg risk {row['avg_churn_risk']:.3f}"
+            )
+
+    # Prepare for column profiling
+    df = scored_df.copy()
+    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+
+    # Identify very high risk subset (if available)
+    vh = None
+    if "risk_band" in df.columns:
+        vh = df[df["risk_band"] == "Very high risk"].copy()
+
+    # Work out numeric vs categorical columns
+    ignore_cols = {"predicted_churn_proba", "risk_band"}
+    all_cols = [c for c in df.columns if c not in ignore_cols]
+
+    numeric_cols = df[all_cols].select_dtypes(include=[np.number]).columns.tolist()
+    cat_cols = [c for c in all_cols if c not in numeric_cols]
+
+    # Limit how many columns we dump into the prompt
+    numeric_cols = numeric_cols[: max_cols]
+    cat_cols = cat_cols[: max_cols]
+
+    # --- Numeric column profiles ---
+    if numeric_cols:
+        lines.append("\nNumeric feature profiles (overall, and very high risk if available):")
+        for col in numeric_cols:
+            series = df[col].dropna()
+            if series.empty:
+                continue
+
+            overall_mean = float(series.mean())
+            overall_min = float(series.min())
+            overall_max = float(series.max())
+
+            line = f"- {col}: overall mean={overall_mean:.3f}, min={overall_min:.3f}, max={overall_max:.3f}"
+
+            if vh is not None and col in vh.columns and not vh[col].dropna().empty:
+                vh_mean = float(vh[col].dropna().mean())
+                line += f"; very_high_risk_mean={vh_mean:.3f}"
+
+            lines.append(line)
+
+    # --- Categorical column profiles ---
+    if cat_cols:
+        lines.append("\nCategorical feature profiles (top categories overall and in very high risk):")
+        for col in cat_cols:
+            # Skip columns with too many unique values (IDs etc.)
+            if df[col].nunique(dropna=True) > 20:
+                continue
+
+            vc_all = df[col].value_counts(normalize=True).head(5)
+            if vc_all.empty:
+                continue
+
+            lines.append(f"\nColumn '{col}' overall distribution (top values):")
+            for val, frac in vc_all.items():
+                lines.append(f"- {val}: {frac * 100:.1f}% of all customers")
+
+            if vh is not None and col in vh.columns:
+                vc_vh = vh[col].value_counts(normalize=True).head(5)
+                if not vc_vh.empty:
+                    lines.append(f"Within VERY HIGH RISK band for '{col}':")
+                    for val, frac in vc_vh.items():
+                        lines.append(f"- {val}: {frac * 100:.1f}% of very high risk customers")
+
+    # Add a small raw sample for grounding
+    sample_cols = [c for c in ["customer_id", "risk_band", "predicted_churn_proba"] if c in df.columns]
+    if sample_cols:
+        sample = df[sample_cols].head(max_rows)
+        lines.append("\nSample of scored customers (first rows):")
+        lines.append(sample.to_string(index=False))
+
+    return "\n".join(lines)
+
+
+
+def ask_llm(question: str, ctx: dict, scored_df: pd.DataFrame):
+    """Ask the LLM for an answer, using churn context. Returns None if LLM not available."""
+    client = get_llm_client()
+    if client is None:
+        return None
+
+    context_text = make_context_text(ctx, scored_df)
+
     try:
-        if "OPENAI_API_KEY" not in st.secrets:
-            return None
-        key = st.secrets["OPENAI_API_KEY"]
-        if not key:
-            return None
-        return OpenAI(api_key=key)
+        completion = client.chat.completions.create(
+            model="openrouter/auto",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a senior customer retention and growth analyst. "
+                        "You are given churn model outputs for a telecom dataset. "
+                        "Use ONLY the provided context and general telco knowledge. "
+                        "Be concise, structured, and business-focused."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Here is the context from the churn model and risk bands:\n\n"
+                        f"{context_text}\n\n"
+                        f"Now answer this question from a product/growth/CS leader:\n{question}"
+                    ),
+                },
+            ],
+            max_tokens=450,
+            temperature=0.4,
+        )
+        return completion.choices[0].message.content.strip()
     except Exception as e:
-        st.warning(f"OpenAI client init failed; falling back to rule-based assistant. Details: {e}")
+        st.warning(f"LLM call failed, falling back to rule-based assistant. Details: {e}")
         return None
 
 
 # ------------------------------------------------
-# Load base training data and load the bundled model
+# Load base training data and train the model
 # ------------------------------------------------
 if not file_exists(TRAIN_PATH):
     st.error(f"Training file not found at `{TRAIN_PATH}`. Please add final_data.csv to the data/ folder.")
     st.stop()
 
 base_df = load_training_data(TRAIN_PATH)
-
-if not file_exists(MODEL_PATH):
-    st.error(f"Model file not found at `{MODEL_PATH}`. Please add telco_churn_model.joblib to the models/ folder.")
-    st.stop()
-
-model = joblib.load(MODEL_PATH)
-
-# Use model-native feature list when available; otherwise fall back to training schema (minus target)
-feature_cols = getattr(model, "feature_names_in_", None)
-if feature_cols is None:
-    feature_cols = [c for c in base_df.columns if c != TARGET_DEFAULT]
-else:
-    feature_cols = list(feature_cols)
+model, feature_cols = train_churn_model(base_df)
 
 # ------------------------------------------------
 # Sidebar – upload new data
@@ -331,7 +596,6 @@ st.sidebar.header("Data settings")
 st.sidebar.write("Upload a telco CSV to run churn scoring + AI analysis.")
 
 uploaded_file = st.sidebar.file_uploader("Upload new customer data (CSV)", type=["csv"])
-
 # ---- Clear chat when dataset changes ----
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -349,182 +613,126 @@ if new_file_key != st.session_state.active_file_key:
     st.session_state.messages = []
     st.session_state.active_file_key = new_file_key
 
-# ------------------------------------------------
-# Main: load uploaded data and run
-# ------------------------------------------------
-if uploaded_file is None:
-    st.info("Upload a CSV from the sidebar to begin.")
-    st.stop()
+scored_df = None
+ctx = {}
 
-try:
-    raw = uploaded_file.read()
-    uploaded_df = pd.read_csv(io.BytesIO(raw))
-except Exception as e:
-    st.error(f"Could not read CSV: {e}")
-    st.stop()
+if uploaded_file is not None:
+    raw_bytes = uploaded_file.read()
+    uploaded_df = pd.read_csv(io.BytesIO(raw_bytes))
 
-uploaded_df = basic_clean(uploaded_df)
+    # NEW: clean + synonym rename
+    uploaded_df = clean_df(uploaded_df)
+    uploaded_df = apply_synonym_renames(uploaded_df)
 
-mode = decide_mode(uploaded_df, training_feature_cols=feature_cols, target=TARGET_DEFAULT)
+    # NEW: decide how to run
+    mode = decide_mode(uploaded_df, feature_cols, target=TARGET_DEFAULT)
 
-if mode == "block":
-    st.error(
-        "This dataset looks too different from the training schema and does not include a churn target. "
-        "Please upload a telco dataset with similar columns, or include the churn_flag column to train-on-upload."
-    )
-    st.stop()
+    if mode == "pretrained":
+        scored_df = score_dataset_aligned(uploaded_df, model, feature_cols)
+        st.sidebar.success("Mode: Pretrained scoring on your upload.")
 
-# Score
-if mode == "train_on_upload":
-    # train model on upload (requires target), then score the same data
-    try:
-        X, y, num_cols, cat_cols = split_features_target(uploaded_df, target=TARGET_DEFAULT)
-
-        numeric_transformer = Pipeline(steps=[
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler())
-        ])
-
-        categorical_transformer = Pipeline(steps=[
-            ("imputer", SimpleImputer(strategy="most_frequent")),
-            ("onehot", OneHotEncoder(handle_unknown="ignore"))
-        ])
-
-        preprocessor = ColumnTransformer(
-            transformers=[
-                ("num", numeric_transformer, num_cols),
-                ("cat", categorical_transformer, cat_cols),
-            ]
-        )
-
-        clf = LogisticRegression(max_iter=500)
-        temp_model = Pipeline(steps=[("prep", preprocessor), ("clf", clf)])
-        temp_model.fit(X, y)
-
-        scored_df = uploaded_df.copy()
-        scored_df = scored_df.drop(columns=[TARGET_DEFAULT], errors="ignore")
-        scored_df = score_with_model(temp_model, scored_df, feature_cols=list(scored_df.columns))
+    elif mode == "train_on_upload":
+        scored_df, _, _ = train_on_upload_and_score(uploaded_df, target=TARGET_DEFAULT)
         st.sidebar.success("Mode: Train-on-upload (trained on your data).")
-    except Exception as e:
-        st.error(f"Train-on-upload failed: {e}")
+
+    else:
+        st.sidebar.error(
+            "Dataset doesn’t match the model schema and no churn/target column was found. "
+            "Add a churn column (e.g., churn_flag) or upload a telco dataset closer to the template."
+        )
         st.stop()
+
+    ctx = build_context(scored_df)
+
 else:
-    scored_df = score_with_model(model, uploaded_df, feature_cols=feature_cols)
-    st.sidebar.success("Mode: Pre-trained model (bundled).")
-
-scored_df = assign_risk_bands(scored_df)
-
-summary = compute_summary(scored_df)
+    st.sidebar.info("No dataset uploaded yet. Please upload a CSV to continue.")
+    st.stop()
 
 # ------------------------------------------------
-# Layout: tabs
+# Main layout – tabs
 # ------------------------------------------------
-tab1, tab2, tab3 = st.tabs(["📊 Scoring Results", "💬 Retention Assistant", "ℹ️ How it works"])
+tab_chat, tab_data, tab_how = st.tabs(["Chat assistant", "Data preview", "How it works"])
 
-with tab1:
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total customers", summary["total_customers"])
-    c2.metric("Average churn risk", f"{summary['avg_risk']:.3f}")
-    c3.metric("Top 10% risk threshold", f"{summary['top_10pct_threshold']:.3f}")
+with tab_chat:
+    st.subheader("Ask questions about churn, risk bands, and retention strategy")
+    if scored_df is None:
+        st.info("Upload a dataset in the sidebar to enable the assistant.")
+        st.stop()
 
-    st.subheader("Risk band distribution")
-    band_summary = (
-        scored_df["risk_band"]
-        .value_counts()
-        .rename_axis("risk_band")
-        .reset_index(name="count")
-    )
-    st.dataframe(band_summary, use_container_width=True)
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
 
-    st.subheader("Top 100 highest-risk customers")
-    top100 = scored_df.sort_values("predicted_churn_proba", ascending=False).head(100)
-    st.dataframe(top100, use_container_width=True)
-
-    st.subheader("Download scored results")
-    csv_bytes = scored_df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        label="Download scored CSV",
-        data=csv_bytes,
-        file_name="scored_churn_results.csv",
-        mime="text/csv"
-    )
-
-with tab2:
-    st.write("Ask questions like:")
-    st.markdown(
-        "- What are the top drivers of churn risk?\n"
-        "- What retention offers should we target to Very High risk customers?\n"
-        "- Give me a prioritized action plan for the top 10% risky customers."
-    )
-
-    client = init_openai_client()
-
-    if client is None:
-        st.warning("No OpenAI API key found in Streamlit secrets. Using a simple rule-based assistant.")
-
-    # Display chat history
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    user_prompt = st.chat_input("Ask a retention question...")
-    if user_prompt:
-        st.session_state.messages.append({"role": "user", "content": user_prompt})
-        with st.chat_message("user"):
-            st.markdown(user_prompt)
+    user_q = st.chat_input("Type your question here...")
+    if user_q:
+        st.session_state.messages.append({"role": "user", "content": user_q})
 
-        context = build_context(scored_df)
+        # 1) Try LLM answer
+        llm_reply = ask_llm(user_q, ctx, scored_df)
 
-        if client is None:
-            # Basic fallback response
-            reply = (
-                "Here are practical next steps:\n\n"
-                "1) Focus on the Very High band first: offer contract upgrades, targeted discounts, and service outreach.\n"
-                "2) For High band: reinforce value (bundles, loyalty perks) and reduce friction (billing, support).\n"
-                "3) Identify patterns: check if specific contract types, payment methods, or high monthly charges dominate the top-risk group.\n\n"
-                "If you share the columns present (contract, monthly charges, tenure), I can tailor the actions to your dataset schema."
-            )
+        if llm_reply:
+            reply = llm_reply
         else:
-            try:
-                messages = [
-                    {"role": "system", "content": "You are a helpful retention strategy assistant."},
-                    {"role": "system", "content": context},
-                    {"role": "user", "content": user_prompt},
-                ]
-                resp = client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=messages,
-                    temperature=0.3,
-                )
-                reply = resp.choices[0].message.content
-            except Exception as e:
-                reply = f"LLM call failed, using fallback. Error: {e}"
+            # 2) Fallback to rule-based answer if LLM not available
+            intent = detect_intent(user_q)
+            reply = assistant_response(user_q, intent, ctx)
 
-        st.session_state.messages.append({"role": "assistant", "content": reply})
         with st.chat_message("assistant"):
             st.markdown(reply)
 
-with tab3:
-    st.subheader("What this app does")
+        st.session_state.messages.append({"role": "assistant", "content": reply})
+
+with tab_data:
+    st.subheader("Scored dataset preview")
+    if scored_df is None:
+        st.info("Upload a dataset in the sidebar to see the preview.")
+        st.stop()
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Customers analysed", f"{ctx.get('n_customers', 0):,}")
+    with c2:
+        if ctx.get("avg_risk") is not None:
+            st.metric("Avg churn risk", format_pct(ctx["avg_risk"]))
+        else:
+            st.metric("Avg churn risk", "N/A")
+    with c3:
+        if ctx.get("p90_risk") is not None:
+            st.metric("Top 10% threshold", format_pct(ctx["p90_risk"]))
+        else:
+            st.metric("Top 10% threshold", "N/A")
+
+    st.write("**Sample of scored customers**")
+    st.dataframe(scored_df.head(25), use_container_width=True)
+
+    if ctx.get("segment_summary") is not None:
+        st.write("**Risk-band summary**")
+        st.dataframe(ctx["segment_summary"], use_container_width=True)
+
+with tab_how:
+    st.subheader("How this works (for your report & interviews)")
     st.markdown(
         """
-- Loads a pre-trained churn model and training schema from the app's folders.
-- You upload a telco customer CSV.
-- The app cleans and aligns your schema (fills missing columns with nulls, ignores extras).
-- It predicts churn probability per row and assigns a risk band:
-  - Low / Medium / High / Very High
-- It shows summary metrics, top risky customers, and lets you download scored results.
-- The assistant uses a compact summary of scored results to recommend retention actions.
-"""
-    )
+1. **Model training**  
+   The app loads `data/final_data.csv` and trains a Logistic Regression churn model in scikit-learn.  
+   It treats `churn_flag` as the target and uses the remaining columns as features (after dropping IDs and any existing prediction columns).
 
-    st.subheader("Expected folders")
-    st.code(
-        """project/
-  App.py
-  data/
-    final_data.csv
-  models/
-    telco_churn_model.joblib
+2. **Scoring & segmentation**  
+   The trained model scores each customer and creates a `predicted_churn_proba` column.  
+   Customers are grouped into four named risk bands: **Low**, **Medium**, **High**, and **Very high risk**.
+
+3. **LLM assistant**  
+   The assistant summarises the churn outputs (risk bands, average risk, top 10%, sample rows) and sends that to an OpenRouter LLM.  
+   The LLM responds like a senior retention analyst.  
+   If the LLM isn’t available, a rule-based backup still gives reasonable answers.
+
+4. **Uploading new data**  
+   You can upload a new cleaned telco CSV in the sidebar.  
+   The model scores that dataset on the fly, and the assistant’s answers are based on that new file.
+
+This gives you a full story for your project: data → model → scoring → AI retention copilot.
 """
     )
