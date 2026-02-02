@@ -147,7 +147,7 @@ def score_dataset(df: pd.DataFrame, model, feature_cols):
 
     df["predicted_churn_proba"] = proba
 
-    # Create 4 risk bands: Low / Medium / High / Very high
+    # Create 4 risk bands: Low / Medium / High 
     try:
         df["risk_band"] = pd.qcut(
             df["predicted_churn_proba"],
@@ -245,7 +245,7 @@ def assistant_response(question: str, intent: str, ctx: dict) -> str:
 
     if intent == "segment_strategy":
         if seg_summary is None or seg_summary.empty:
-            return "I couldn’t create risk bands. Once 'predicted_churn_proba' is available, I’ll group customers into Low / Medium / High / Very high risk segments."
+            return "I couldn’t create risk bands. Once 'predicted_churn_proba' is available, I’ll group customers into Low / Medium / High risk segments."
 
         rank = parse_rank(question)
         if rank > len(seg_summary):
@@ -272,7 +272,7 @@ def assistant_response(question: str, intent: str, ctx: dict) -> str:
         return (
             "Here are three simple, data-driven experiments you can run based on churn scores:\n\n"
             "1) **Top-risk outreach**\n"
-            "   - Target: Customers in the 'Very high risk' band.\n"
+            "   - Target: Customers in the 'high risk' band.\n"
             "   - Action: Proactive outreach (email/SMS/call) with a personalised retention offer.\n"
             "   - KPI: 30-day churn rate vs a control group.\n\n"
             "2) **Support experience upgrade**\n"
@@ -332,8 +332,8 @@ def make_context_text(ctx: dict, scored_df: pd.DataFrame, max_rows: int = 5, max
     Turn model outputs into a richer text summary for the LLM.
 
     It automatically profiles ALL columns:
-    - numeric columns: mean, min, max overall and (if available) in very high risk
-    - categorical columns: top categories overall and in very high risk
+    - numeric columns: mean, min, max overall and (if available) in  high risk
+    - categorical columns: top categories overall and in high risk
     """
     lines = []
 
@@ -361,7 +361,7 @@ def make_context_text(ctx: dict, scored_df: pd.DataFrame, max_rows: int = 5, max
 
     vh = None
     if "risk_band" in df.columns:
-        vh = df[df["risk_band"] == "Very high risk"].copy()
+        vh = df[df["risk_band"] == " high risk"].copy()
 
     ignore_cols = {"predicted_churn_proba", "risk_band"}
     all_cols = [c for c in df.columns if c not in ignore_cols]
@@ -373,7 +373,7 @@ def make_context_text(ctx: dict, scored_df: pd.DataFrame, max_rows: int = 5, max
     cat_cols = cat_cols[: max_cols]
 
     if numeric_cols:
-        lines.append("\nNumeric feature profiles (overall, and very high risk if available):")
+        lines.append("\nNumeric feature profiles (overall, and high risk if available):")
         for col in numeric_cols:
             series = df[col].dropna()
             if series.empty:
@@ -392,7 +392,7 @@ def make_context_text(ctx: dict, scored_df: pd.DataFrame, max_rows: int = 5, max
             lines.append(line)
 
     if cat_cols:
-        lines.append("\nCategorical feature profiles (top categories overall and in very high risk):")
+        lines.append("\nCategorical feature profiles (top categories overall and in high risk):")
         for col in cat_cols:
             if df[col].nunique(dropna=True) > 20:
                 continue
@@ -408,9 +408,9 @@ def make_context_text(ctx: dict, scored_df: pd.DataFrame, max_rows: int = 5, max
             if vh is not None and col in vh.columns:
                 vc_vh = vh[col].value_counts(normalize=True).head(5)
                 if not vc_vh.empty:
-                    lines.append(f"Within VERY HIGH RISK band for '{col}':")
+                    lines.append(f"Within HIGH RISK band for '{col}':")
                     for val, frac in vc_vh.items():
-                        lines.append(f"- {val}: {frac * 100:.1f}% of very high risk customers")
+                        lines.append(f"- {val}: {frac * 100:.1f}% of high risk customers")
 
     sample_cols = [c for c in ["customer_id", "risk_band", "predicted_churn_proba"] if c in df.columns]
     if sample_cols:
