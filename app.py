@@ -570,7 +570,7 @@ with tab_how:
 
 3. **Scoring & segmentation**  
    The trained model scores each uploaded customer and creates a `predicted_churn_proba` column.  
-   Customers are grouped into four named risk bands: **Low**, **Medium**, **High**, and **Very high risk**.
+   Customers are grouped into four named risk bands: **Low**, **Medium**, **High**.
 
 4. **LLM assistant**  
    The assistant summarises churn outputs (risk bands, averages, top 10%, sample rows) and sends that to an OpenRouter LLM.  
