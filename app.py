@@ -1,15 +1,10 @@
 import os
 import io
+import joblib
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression
 
 from groq import Groq
 
@@ -18,136 +13,71 @@ from groq import Groq
 # Basic page config
 # ------------------------------------------------
 st.set_page_config(
-    page_title="RetentionGPT – Telco Churn Assistant",
+    page_title="RetentionGPT – Churn Assistant",
     page_icon="📉",
     layout="wide"
 )
 
-st.title("RetentionGPT – Telco Churn & Retention Assistant")
-st.caption("Train a churn model on telco data, score customers, and ask an AI assistant for retention strategy.")
+st.title("RetentionGPT – Churn & Retention Assistant")
+st.caption("Upload your customer CSV, score churn risk, and ask an AI assistant for retention strategy.")
 
-DATA_DIR = "data"
-TRAIN_PATH = os.path.join(DATA_DIR, "final_data.csv")
+MODEL_PATH = "models/retention_minimal_model.joblib"
 
 
 # ------------------------------------------------
-# Helper functions
+# Model loader
 # ------------------------------------------------
-def file_exists(path: str) -> bool:
-    return os.path.exists(path) and os.path.getsize(path) > 0
+@st.cache_resource(show_spinner=False)
+def load_model():
+    if not os.path.exists(MODEL_PATH):
+        return None
+    return joblib.load(MODEL_PATH)
 
 
-@st.cache_data(show_spinner=False)
-def load_training_data(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
-    return df
-
-
-def split_features_target(df: pd.DataFrame):
-    if "churn_flag" not in df.columns:
-        raise ValueError("Dataset must contain a 'churn_flag' column.")
-
-    y = df["churn_flag"].astype(int)
-
-    # Drop obvious leakage / ID columns if present
-    drop_cols = [
-        "churn_flag",
-        "predicted_churn_proba",
-        "predicted_ltv",
-        "predicted_remaining_months",
-        "customer_id",
-    ]
-    drop_cols = [c for c in drop_cols if c in df.columns]
-
-    X = df.drop(columns=drop_cols)
-
-    num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
-    cat_cols = [c for c in X.columns if c not in num_cols]
-
-    return X, y, num_cols, cat_cols
-
-
-@st.cache_resource(show_spinner=True)
-def train_churn_model(df: pd.DataFrame):
-    """Train a simple, robust churn model from the training dataset."""
-    X, y, num_cols, cat_cols = split_features_target(df)
-
-    numeric_transformer = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler", StandardScaler())
-    ])
-
-    categorical_transformer = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("onehot", OneHotEncoder(handle_unknown="ignore"))
-    ])
-
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ("num", numeric_transformer, num_cols),
-            ("cat", categorical_transformer, cat_cols),
-        ]
-    )
-
-    clf = LogisticRegression(max_iter=500)
-
-    model = Pipeline(steps=[
-        ("prep", preprocessor),
-        ("clf", clf),
-    ])
-
-    model.fit(X, y)
-
-    return model, X.columns.tolist()
-
-
-def score_dataset(df: pd.DataFrame, model, feature_cols):
-    """
-    Apply the trained model to any dataset and add churn proba + risk band.
-
-    Robust to:
-    - missing columns (fills them with NaN so the imputers use training defaults)
-    - extra columns (kept for LLM context but ignored by the model)
-    """
+# ------------------------------------------------
+# Scoring (requires: tenure, contract, totalcharges)
+# ------------------------------------------------
+def score_dataset(df: pd.DataFrame, model):
     df = df.copy()
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
 
-    # Build X with EXACTLY the same columns and order used in training
-    X = pd.DataFrame(index=df.index)
-    missing_cols = []
-    for col in feature_cols:
-        if col in df.columns:
-            X[col] = df[col]
-        else:
-            X[col] = np.nan
-            missing_cols.append(col)
-
-    if missing_cols:
-        st.warning(
-            f"Uploaded data is missing {len(missing_cols)} feature columns the model was trained on. "
-            "Those columns will use training defaults during scoring. "
-            f"Examples: {', '.join(missing_cols[:8])}"
-            + (" ..." if len(missing_cols) > 8 else "")
+    required = ["tenure", "contract", "totalcharges"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        st.error(
+            "Missing required columns for scoring: "
+            + ", ".join(missing)
+            + ". Required: tenure, contract, totalcharges."
         )
+        st.stop()
 
-    extra_cols = [c for c in df.columns if c not in feature_cols + ["churn_flag", "predicted_churn_proba", "risk_band"]]
-    if extra_cols:
-        st.info(
-            f"Uploaded data includes {len(extra_cols)} extra columns the model does not use. "
-            f"Examples: {', '.join(extra_cols[:8])}"
-            + (" ..." if len(extra_cols) > 8 else "")
-        )
+    # Tenure -> numeric
+    df["tenure"] = pd.to_numeric(df["tenure"], errors="coerce")
+
+    # TotalCharges -> numeric (strip currency/commas)
+    df["totalcharges"] = (
+        df["totalcharges"]
+        .astype(str)
+        .str.strip()
+        .str.replace(r"[\$,]", "", regex=True)
+        .replace({"": np.nan, "nan": np.nan, "None": np.nan})
+    )
+    df["totalcharges"] = pd.to_numeric(df["totalcharges"], errors="coerce")
+
+    # Derived feature (must match training)
+    df["avg_monthly_spend"] = df["totalcharges"] / df["tenure"].clip(lower=1)
+
+    X = df[["tenure", "totalcharges", "avg_monthly_spend", "contract"]]
 
     try:
         proba = model.predict_proba(X)[:, 1]
     except Exception as e:
-        st.error(f"Could not score the uploaded dataset with the trained model. Details: {e}")
+        st.error(f"Could not score the uploaded dataset. Details: {e}")
         raise
 
     df["predicted_churn_proba"] = proba
 
-    # Create 4 risk bands: Low / Medium / High 
+    # 3 risk bands
     try:
         df["risk_band"] = pd.qcut(
             df["predicted_churn_proba"],
@@ -164,6 +94,9 @@ def score_dataset(df: pd.DataFrame, model, feature_cols):
     return df
 
 
+# ------------------------------------------------
+# Context + assistant
+# ------------------------------------------------
 def build_context(scored_df: pd.DataFrame):
     ctx = {}
 
@@ -206,7 +139,6 @@ def detect_intent(text: str) -> str:
 
 
 def parse_rank(text: str) -> int:
-    """Detect '2nd', 'second', 'third' etc. Default is 1 (top segment)."""
     t = text.lower()
     if "second" in t or "2nd" in t:
         return 2
@@ -222,7 +154,6 @@ def format_pct(x):
 
 
 def assistant_response(question: str, intent: str, ctx: dict) -> str:
-    """Rule-based backup assistant (used if LLM fails)."""
     avg_risk = ctx.get("avg_risk")
     p90_risk = ctx.get("p90_risk")
     top_risk_count = ctx.get("top_risk_count")
@@ -230,22 +161,22 @@ def assistant_response(question: str, intent: str, ctx: dict) -> str:
     seg_summary = ctx.get("segment_summary")
 
     if not ctx:
-        return "I wasn't able to build context from the data. Please check that the file has a 'churn_flag' column and re-run."
+        return "I wasn't able to build context from the data."
 
     if intent == "revenue":
         if avg_risk is None:
-            return "I can’t estimate revenue risk without churn scores, but the model should have created 'predicted_churn_proba'."
+            return "I can’t estimate revenue risk without churn scores."
         return (
             f"In this dataset I see **{n_customers:,} customers**.\n\n"
             f"- Average churn risk: **{format_pct(avg_risk)}**\n"
             f"- Top 10% churn risk threshold: **{format_pct(p90_risk)}**\n"
             f"- Customers in that top-risk bucket: **{top_risk_count:,}**\n\n"
-            "You’d normally multiply those probabilities by ARPU or LTV to estimate revenue at risk."
+            "If you have revenue/LTV columns, multiply probabilities by value to estimate revenue at risk."
         )
 
     if intent == "segment_strategy":
         if seg_summary is None or seg_summary.empty:
-            return "I couldn’t create risk bands. Once 'predicted_churn_proba' is available, I’ll group customers into Low / Medium / High risk segments."
+            return "I couldn’t create risk bands."
 
         rank = parse_rank(question)
         if rank > len(seg_summary):
@@ -263,78 +194,59 @@ def assistant_response(question: str, intent: str, ctx: dict) -> str:
             f"- Customers in this segment: **{seg_customers:,}**\n"
             f"- Average churn risk: **{format_pct(avg_seg_risk)}**\n\n"
             "Suggested focus:\n"
-            "1. Review this segment’s profile in your dashboard (tenure, plan, usage, support tickets).\n"
-            "2. Design targeted retention offers for this group.\n"
-            "3. Track churn over the next 30–60 days to see if the risk actually drops."
+            "1. Prioritize outreach for High risk.\n"
+            "2. Offer contract upgrades or targeted incentives.\n"
+            "3. Track churn over the next 30–60 days."
         )
 
     if intent == "experiments":
         return (
-            "Here are three simple, data-driven experiments you can run based on churn scores:\n\n"
-            "1) **Top-risk outreach**\n"
-            "   - Target: Customers in the 'high risk' band.\n"
-            "   - Action: Proactive outreach (email/SMS/call) with a personalised retention offer.\n"
-            "   - KPI: 30-day churn rate vs a control group.\n\n"
-            "2) **Support experience upgrade**\n"
-            "   - Target: High-risk customers with recent support tickets.\n"
-            "   - Action: Fast-track queueing or follow-up calls to close open issues.\n"
-            "   - KPI: Ticket resolution time and churn rate.\n\n"
-            "3) **Usage reactivation nudges**\n"
-            "   - Target: Medium-risk customers whose usage has dropped.\n"
-            "   - Action: In-app tips, bonus data, or reminder campaigns.\n"
-            "   - KPI: change in usage and churn over 30–60 days."
+            "Three experiments you can run:\n\n"
+            "1) **High-risk outreach** (High risk)\n"
+            "2) **Contract upgrade offer** (Medium risk)\n"
+            "3) **Value reinforcement nudges** (Low/Medium risk)\n"
         )
 
     if intent == "churn_explain":
         lines = []
         if avg_risk is not None:
-            lines.append(f"Across all customers, the average predicted churn risk is **{format_pct(avg_risk)}**.")
-            lines.append(f"The riskiest 10% of customers are above **{format_pct(p90_risk)}** churn probability.")
+            lines.append(f"Average predicted churn risk is **{format_pct(avg_risk)}**.")
+            lines.append(f"Top 10% of customers are above **{format_pct(p90_risk)}** churn probability.")
         if seg_summary is not None and not seg_summary.empty:
             top = seg_summary.iloc[0]
             lines.append(
-                f"The most at-risk segment is **{top['risk_band']}** with "
+                f"Most at-risk segment is **{top['risk_band']}** with "
                 f"**{format_pct(top['avg_churn_risk'])}** average churn risk "
                 f"across **{int(top['customers']):,} customers**."
             )
         lines.append(
-            "\nTo understand *why*, you’d typically look at:\n"
-            "- tenure (short vs long)\n"
-            "- contract type (month-to-month vs longer-term)\n"
-            "- billing method and payment issues\n"
-            "- product usage and support tickets"
+            "\nTypically, churn risk is driven by:\n"
+            "- shorter tenure\n"
+            "- month-to-month contracts\n"
+            "- higher spend relative to tenure"
         )
         return "\n\n".join(lines)
 
     return (
-        "I’ve run a churn model on your data and grouped customers into risk bands.\n\n"
-        "You can ask things like:\n"
-        "- *Which segment should we prioritise?*\n"
-        "- *Who is in the second highest-risk segment?*\n"
-        "- *How much churn risk do we see overall?*\n"
-        "- *What experiments should we run to reduce churn?*"
+        "Ask things like:\n"
+        "- Which segment should we prioritize?\n"
+        "- Who is in the second highest-risk segment?\n"
+        "- What experiments should we run to reduce churn?"
     )
 
 
-# ---------- LLM helpers (OpenRouter via OpenAI client) ----------
-
+# ------------------------------------------------
+# LLM helpers (Groq)
+# ------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def get_llm_client():
     api_key = st.secrets.get("GROQ_API_KEY")
     if not api_key:
         return None
     return Groq(api_key=api_key)
-    return client
 
 
 def make_context_text(ctx: dict, scored_df: pd.DataFrame, max_rows: int = 5, max_cols: int = 12) -> str:
-    """
-    Turn model outputs into a richer text summary for the LLM.
-
-    It automatically profiles ALL columns:
-    - numeric columns: mean, min, max overall and (if available) in  high risk
-    - categorical columns: top categories overall and in high risk
-    """
     lines = []
 
     n = ctx.get("n_customers")
@@ -359,18 +271,15 @@ def make_context_text(ctx: dict, scored_df: pd.DataFrame, max_rows: int = 5, max
     df = scored_df.copy()
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
 
-    vh = None
+    high = None
     if "risk_band" in df.columns:
-        vh = df[df["risk_band"] == " high risk"].copy()
+        high = df[df["risk_band"] == "High risk"].copy()
 
     ignore_cols = {"predicted_churn_proba", "risk_band"}
     all_cols = [c for c in df.columns if c not in ignore_cols]
 
-    numeric_cols = df[all_cols].select_dtypes(include=[np.number]).columns.tolist()
-    cat_cols = [c for c in all_cols if c not in numeric_cols]
-
-    numeric_cols = numeric_cols[: max_cols]
-    cat_cols = cat_cols[: max_cols]
+    numeric_cols = df[all_cols].select_dtypes(include=[np.number]).columns.tolist()[:max_cols]
+    cat_cols = [c for c in all_cols if c not in numeric_cols][:max_cols]
 
     if numeric_cols:
         lines.append("\nNumeric feature profiles (overall, and high risk if available):")
@@ -385,9 +294,9 @@ def make_context_text(ctx: dict, scored_df: pd.DataFrame, max_rows: int = 5, max
 
             line = f"- {col}: overall mean={overall_mean:.3f}, min={overall_min:.3f}, max={overall_max:.3f}"
 
-            if vh is not None and col in vh.columns and not vh[col].dropna().empty:
-                vh_mean = float(vh[col].dropna().mean())
-                line += f"; very_high_risk_mean={vh_mean:.3f}"
+            if high is not None and col in high.columns and not high[col].dropna().empty:
+                high_mean = float(high[col].dropna().mean())
+                line += f"; high_risk_mean={high_mean:.3f}"
 
             lines.append(line)
 
@@ -405,11 +314,11 @@ def make_context_text(ctx: dict, scored_df: pd.DataFrame, max_rows: int = 5, max
             for val, frac in vc_all.items():
                 lines.append(f"- {val}: {frac * 100:.1f}% of all customers")
 
-            if vh is not None and col in vh.columns:
-                vc_vh = vh[col].value_counts(normalize=True).head(5)
-                if not vc_vh.empty:
+            if high is not None and col in high.columns:
+                vc_high = high[col].value_counts(normalize=True).head(5)
+                if not vc_high.empty:
                     lines.append(f"Within HIGH RISK band for '{col}':")
-                    for val, frac in vc_vh.items():
+                    for val, frac in vc_high.items():
                         lines.append(f"- {val}: {frac * 100:.1f}% of high risk customers")
 
     sample_cols = [c for c in ["customer_id", "risk_band", "predicted_churn_proba"] if c in df.columns]
@@ -436,8 +345,8 @@ def ask_llm(question: str, ctx: dict, scored_df: pd.DataFrame):
                     "role": "system",
                     "content": (
                         "You are a senior customer retention and growth analyst. "
-                        "You are given churn model outputs for a telecom dataset. "
-                        "Use ONLY the provided context and general telco knowledge. "
+                        "You are given churn model outputs for a telecom-style dataset. "
+                        "Use ONLY the provided context and general retention knowledge. "
                         "Be concise, structured, and business-focused."
                     ),
                 },
@@ -453,31 +362,26 @@ def ask_llm(question: str, ctx: dict, scored_df: pd.DataFrame):
             temperature=0.4,
             max_tokens=450,
         )
-
         return completion.choices[0].message.content.strip()
-
     except Exception as e:
         st.warning(f"GROQ call failed, falling back to rule-based assistant. Details: {e}")
         return None
 
 
-
 # ------------------------------------------------
-# Load base training data and train the model
-# (Still happens at startup, but NOTHING is displayed/scored until user uploads data.)
+# Load model (no runtime training)
 # ------------------------------------------------
-if not file_exists(TRAIN_PATH):
-    st.error(f"Training file not found at `{TRAIN_PATH}`. Please add final_data.csv to the data/ folder.")
+model = load_model()
+if model is None:
+    st.error(f"Model not found at `{MODEL_PATH}`. Upload `models/retention_minimal_model.joblib` to the repo.")
     st.stop()
 
-base_df = load_training_data(TRAIN_PATH)
-model, feature_cols = train_churn_model(base_df)
 
 # ------------------------------------------------
-# Upload-first gate (NO default dataset display)
+# Upload-first gate
 # ------------------------------------------------
 st.sidebar.header("Upload (required)")
-st.sidebar.write("Upload a customer CSV to start. The app won’t show any dataset until you upload one.")
+st.sidebar.write("Upload a customer CSV to start (must include: tenure, contract, totalcharges).")
 
 uploaded_file = st.sidebar.file_uploader("Upload customer data (CSV)", type=["csv"])
 
@@ -485,20 +389,18 @@ if uploaded_file is None:
     st.info("Upload a CSV from the left sidebar to begin scoring and analysis.")
     st.stop()
 
-# Read uploaded file
 raw_bytes = uploaded_file.read()
 uploaded_df = pd.read_csv(io.BytesIO(raw_bytes))
 uploaded_df.columns = [c.strip().lower().replace(" ", "_") for c in uploaded_df.columns]
 
-# Reset chat when a new file is uploaded (prevents mixing context)
 file_fingerprint = f"{getattr(uploaded_file, 'name', 'uploaded.csv')}::{len(raw_bytes)}"
 if st.session_state.get("last_uploaded_file") != file_fingerprint:
     st.session_state["last_uploaded_file"] = file_fingerprint
     st.session_state["messages"] = []
 
-# Score uploaded data
-scored_df = score_dataset(uploaded_df, model, feature_cols)
+scored_df = score_dataset(uploaded_df, model)
 ctx = build_context(scored_df)
+
 
 # ------------------------------------------------
 # Main layout – tabs
@@ -556,26 +458,35 @@ with tab_data:
         st.write("**Risk-band summary**")
         st.dataframe(ctx["segment_summary"], use_container_width=True)
 
+    st.download_button(
+        "Download scored customers (CSV)",
+        data=scored_df.to_csv(index=False),
+        file_name="scored_customers.csv",
+        mime="text/csv"
+    )
+
 with tab_how:
     st.subheader("How this works (for your report & interviews)")
     st.markdown(
         """
-1. **Model training**  
-   The app loads `data/final_data.csv` and trains a Logistic Regression churn model in scikit-learn.  
-   It treats `churn_flag` as the target and uses the remaining columns as features (after dropping IDs and any existing prediction columns).
+1. **Model**  
+   The app loads a pre-trained churn model from `models/retention_minimal_model.joblib`.
 
-2. **Upload-first behaviour**  
-   The app does **not** display or score the built-in dataset.  
-   It waits for the user to upload a CSV. Only after upload will scoring, segmentation, and chat become available.
+2. **Upload-first**  
+   The app shows nothing until a CSV is uploaded.
 
-3. **Scoring & segmentation**  
-   The trained model scores each uploaded customer and creates a `predicted_churn_proba` column.  
-   Customers are grouped into four named risk bands: **Low**, **Medium**, **High**.
+3. **Required columns**  
+   Your uploaded CSV must include:
+   - `tenure` (numeric)
+   - `contract` (categorical)
+   - `totalcharges` (numeric / currency-like)
 
-4. **LLM assistant**  
-   The assistant summarises churn outputs (risk bands, averages, top 10%, sample rows) and sends that to an OpenRouter LLM.  
-   If the LLM isn’t available, a rule-based backup still gives reasonable answers.
+4. **Scoring & segmentation**  
+   The app creates:
+   - `predicted_churn_proba`
+   - `risk_band` (Low / Medium / High)
 
-This gives you a clean story: train → upload → score → segment → retention copilot.
+5. **Assistant**  
+   Optional Groq LLM answers questions using a data-driven context. If unavailable, a rule-based assistant responds.
 """
     )
