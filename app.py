@@ -37,6 +37,25 @@ def load_model():
 # ------------------------------------------------
 # Scoring (requires: tenure, contract, totalcharges)
 # ------------------------------------------------
+REQUIRED_FIELDS = {
+    "tenure": "Tenure",
+    "contract": "Contract",
+    "totalcharges": "Total Charges",
+}
+
+def normalize_name(s: str) -> str:
+    return s.strip().lower().replace(" ", "_")
+
+def apply_mapping(df: pd.DataFrame, mapping: dict) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [normalize_name(c) for c in df.columns]
+    rename_map = {}
+    for canonical, chosen in mapping.items():
+        if chosen:
+            rename_map[normalize_name(chosen)] = canonical
+    return df.rename(columns=rename_map)
+
+
 def score_dataset(df: pd.DataFrame, model):
     df = df.copy()
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
@@ -383,6 +402,9 @@ if model is None:
 st.sidebar.header("Upload (required)")
 st.sidebar.write("Upload a customer CSV to start (must include: tenure, contract, totalcharges).")
 
+st.sidebar.header("Upload (required)")
+st.sidebar.write("Upload a CSV. If required columns are missing, you'll map them before scoring.")
+
 uploaded_file = st.sidebar.file_uploader("Upload customer data (CSV)", type=["csv"])
 
 if uploaded_file is None:
@@ -390,15 +412,79 @@ if uploaded_file is None:
     st.stop()
 
 raw_bytes = uploaded_file.read()
-uploaded_df = pd.read_csv(io.BytesIO(raw_bytes))
-uploaded_df.columns = [c.strip().lower().replace(" ", "_") for c in uploaded_df.columns]
+uploaded_df_raw = pd.read_csv(io.BytesIO(raw_bytes))
+uploaded_df_raw.columns = [normalize_name(c) for c in uploaded_df_raw.columns]
 
 file_fingerprint = f"{getattr(uploaded_file, 'name', 'uploaded.csv')}::{len(raw_bytes)}"
 if st.session_state.get("last_uploaded_file") != file_fingerprint:
     st.session_state["last_uploaded_file"] = file_fingerprint
     st.session_state["messages"] = []
+    st.session_state["col_map"] = {}  # reset mapping on new file
 
+cols = uploaded_df_raw.columns.tolist()
+required = ["tenure", "contract", "totalcharges"]
+missing = [c for c in required if c not in cols]
+
+# --- Mapping UI (only if missing) ---
+if missing:
+    st.warning("Required columns are missing. Map your columns to continue scoring.")
+
+    # build dropdown options
+    options = ["— Select —"] + cols
+
+    current_map = st.session_state.get("col_map", {})
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        sel_tenure = st.selectbox(
+            "Map to Tenure",
+            options,
+            index=options.index(current_map.get("tenure")) if current_map.get("tenure") in options else 0
+        )
+    with col2:
+        sel_contract = st.selectbox(
+            "Map to Contract",
+            options,
+            index=options.index(current_map.get("contract")) if current_map.get("contract") in options else 0
+        )
+    with col3:
+        sel_total = st.selectbox(
+            "Map to Total Charges",
+            options,
+            index=options.index(current_map.get("totalcharges")) if current_map.get("totalcharges") in options else 0
+        )
+
+    # save selections
+    chosen_map = {
+        "tenure": None if sel_tenure == "— Select —" else sel_tenure,
+        "contract": None if sel_contract == "— Select —" else sel_contract,
+        "totalcharges": None if sel_total == "— Select —" else sel_total,
+    }
+    st.session_state["col_map"] = chosen_map
+
+    # validate: all selected + no duplicates
+    chosen_vals = [v for v in chosen_map.values() if v is not None]
+    if len(chosen_vals) < 3:
+        st.info("Select a column for Tenure, Contract, and Total Charges to continue.")
+        st.stop()
+
+    if len(set(chosen_vals)) != 3:
+        st.error("Each required field must map to a different column.")
+        st.stop()
+
+    if not st.button("Confirm mapping & score"):
+        st.stop()
+
+    uploaded_df = apply_mapping(uploaded_df_raw, chosen_map)
+
+else:
+    # columns already present, no mapping needed
+    uploaded_df = uploaded_df_raw
+
+# --- Score after mapping (or directly) ---
 scored_df = score_dataset(uploaded_df, model)
+ctx = build_context(scored_df)
+
 ctx = build_context(scored_df)
 
 
