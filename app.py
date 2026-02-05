@@ -18,6 +18,16 @@ st.set_page_config(
     layout="wide"
 )
 
+# 👉 PASTE SESSION DEFAULTS HERE
+if "messages" not in st.session_state:
+    st.session_state["messages"] = []
+if "col_map" not in st.session_state:
+    st.session_state["col_map"] = {}
+if "mapping_confirmed" not in st.session_state:
+    st.session_state["mapping_confirmed"] = False
+if "last_uploaded_file" not in st.session_state:
+    st.session_state["last_uploaded_file"] = None
+
 st.title("RetentionGPT – Churn & Retention Assistant")
 st.caption("Upload your customer CSV, score churn risk, and ask an AI assistant for retention strategy.")
 
@@ -400,10 +410,7 @@ if model is None:
 # Upload-first gate
 # ------------------------------------------------
 st.sidebar.header("Upload (required)")
-st.sidebar.write("Upload a customer CSV to start (must include: tenure, contract, totalcharges).")
-
-st.sidebar.header("Upload (required)")
-st.sidebar.write("Upload a CSV. If required columns are missing, you'll map them before scoring.")
+st.sidebar.write("Upload a CSV. If required columns are missing, you'll map them once, then chat normally.")
 
 uploaded_file = st.sidebar.file_uploader("Upload customer data (CSV)", type=["csv"])
 
@@ -416,45 +423,46 @@ uploaded_df_raw = pd.read_csv(io.BytesIO(raw_bytes))
 uploaded_df_raw.columns = [normalize_name(c) for c in uploaded_df_raw.columns]
 
 file_fingerprint = f"{getattr(uploaded_file, 'name', 'uploaded.csv')}::{len(raw_bytes)}"
-if st.session_state.get("last_uploaded_file") != file_fingerprint:
+if st.session_state["last_uploaded_file"] != file_fingerprint:
     st.session_state["last_uploaded_file"] = file_fingerprint
     st.session_state["messages"] = []
-    st.session_state["col_map"] = {}  # reset mapping on new file
+    st.session_state["col_map"] = {}
+    st.session_state["mapping_confirmed"] = False
 
 cols = uploaded_df_raw.columns.tolist()
 required = ["tenure", "contract", "totalcharges"]
 missing = [c for c in required if c not in cols]
 
-# --- Mapping UI (only if missing) ---
-if missing:
-    st.warning("Required columns are missing. Map your columns to continue scoring.")
+# If missing and not confirmed yet -> show mapping UI and stop until confirmed
+if missing and not st.session_state["mapping_confirmed"]:
+    st.warning("Required columns are missing. Map your columns once to continue scoring.")
 
-    # build dropdown options
     options = ["— Select —"] + cols
-
     current_map = st.session_state.get("col_map", {})
-    col1, col2, col3 = st.columns(3)
 
+    col1, col2, col3 = st.columns(3)
     with col1:
         sel_tenure = st.selectbox(
             "Map to Tenure",
             options,
-            index=options.index(current_map.get("tenure")) if current_map.get("tenure") in options else 0
+            index=options.index(current_map.get("tenure")) if current_map.get("tenure") in options else 0,
+            key="map_tenure"
         )
     with col2:
         sel_contract = st.selectbox(
             "Map to Contract",
             options,
-            index=options.index(current_map.get("contract")) if current_map.get("contract") in options else 0
+            index=options.index(current_map.get("contract")) if current_map.get("contract") in options else 0,
+            key="map_contract"
         )
     with col3:
         sel_total = st.selectbox(
             "Map to Total Charges",
             options,
-            index=options.index(current_map.get("totalcharges")) if current_map.get("totalcharges") in options else 0
+            index=options.index(current_map.get("totalcharges")) if current_map.get("totalcharges") in options else 0,
+            key="map_totalcharges"
         )
 
-    # save selections
     chosen_map = {
         "tenure": None if sel_tenure == "— Select —" else sel_tenure,
         "contract": None if sel_contract == "— Select —" else sel_contract,
@@ -462,30 +470,31 @@ if missing:
     }
     st.session_state["col_map"] = chosen_map
 
-    # validate: all selected + no duplicates
     chosen_vals = [v for v in chosen_map.values() if v is not None]
     if len(chosen_vals) < 3:
-        st.info("Select a column for Tenure, Contract, and Total Charges to continue.")
+        st.info("Select a column for Tenure, Contract, and Total Charges.")
         st.stop()
 
     if len(set(chosen_vals)) != 3:
         st.error("Each required field must map to a different column.")
         st.stop()
 
-    if not st.button("Confirm mapping & score"):
+    if st.button("Confirm mapping and score", type="primary"):
+        st.session_state["mapping_confirmed"] = True
+        st.rerun()
+    else:
         st.stop()
 
-    uploaded_df = apply_mapping(uploaded_df_raw, chosen_map)
-
+# If missing but confirmed -> apply mapping
+if missing and st.session_state["mapping_confirmed"]:
+    uploaded_df = apply_mapping(uploaded_df_raw, st.session_state["col_map"])
 else:
-    # columns already present, no mapping needed
     uploaded_df = uploaded_df_raw
 
-# --- Score after mapping (or directly) ---
+# Score once per rerun, but no extra clicks required
 scored_df = score_dataset(uploaded_df, model)
 ctx = build_context(scored_df)
 
-ctx = build_context(scored_df)
 
 
 # ------------------------------------------------
