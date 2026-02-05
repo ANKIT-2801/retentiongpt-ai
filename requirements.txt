@@ -1,6 +1,7 @@
 streamlit
 pandas
 numpy
-scikit-learn
-openai
+joblib==1.4.2
+scikit-learn==1.5.2
 groq
+
