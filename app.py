@@ -339,7 +339,7 @@ def ask_llm(question: str, ctx: dict, scored_df: pd.DataFrame):
 
     try:
         completion = client.chat.completions.create(
-            model="llama3-70b-8192",
+            model="openai/gpt-oss-120b",
             messages=[
                 {
                     "role": "system",
