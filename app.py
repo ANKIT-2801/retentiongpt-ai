@@ -504,6 +504,14 @@ tab_chat, tab_data, tab_how = st.tabs(["Chat assistant", "Data preview", "How it
 
 with tab_chat:
     st.subheader("Ask questions about churn, risk bands, and retention strategy")
+    st.markdown("""
+**Try asking:**
+- Which segment should we prioritize?
+- Why are customers churning?
+- What experiments should we run?
+- What does high risk typically look like?
+""")
+    st.caption("Tip: Responses are based on your uploaded data and the churn model outputs.")
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
@@ -531,6 +539,21 @@ with tab_chat:
 
 with tab_data:
     st.subheader("Scored dataset preview")
+    with st.expander("How to interpret these results"):
+        st.markdown("""
+**What is churn probability?**  
+Each customer receives a probability between 0 and 1 representing likelihood of churn.
+
+**What do the risk bands mean?**
+- High risk → Top third most likely to churn
+- Medium risk → Middle third
+- Low risk → Bottom third, relatively stable customers
+
+**How to use this:**
+- Focus retention efforts on High risk customers.
+- Test incentives on Medium risk.
+- Monitor and upsell Low risk customers.
+""")
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -545,6 +568,7 @@ with tab_data:
             st.metric("Top 10% threshold", format_pct(ctx["p90_risk"]))
         else:
             st.metric("Top 10% threshold", "N/A")
+    st.caption("Risk bands are relative within this uploaded dataset (top/middle/bottom third), not absolute industry benchmarks.")
 
     st.write("**Sample of scored customers**")
     st.dataframe(scored_df.head(25), use_container_width=True)
@@ -552,6 +576,33 @@ with tab_data:
     if ctx.get("segment_summary") is not None:
         st.write("**Risk-band summary**")
         st.dataframe(ctx["segment_summary"], use_container_width=True)
+    st.subheader("Who to prioritize first (Top High Risk Customers)")
+
+    show_cols = [c for c in ["customer_id", "tenure", "contract", "totalcharges", "predicted_churn_proba", "risk_band"] if c in scored_df.columns]
+
+    st.dataframe(
+        scored_df.sort_values("predicted_churn_proba", ascending=False).head(25)[show_cols],
+        use_container_width=True
+    )
+        
+    st.subheader("Recommended Actions by Segment")
+
+    st.markdown("""
+**High Risk**
+- Immediate outreach
+- Contract upgrade offers
+- Targeted retention incentives
+
+**Medium Risk**
+- Monitor engagement
+- Run small retention experiments
+- Improve onboarding or feature adoption
+
+**Low Risk**
+- Maintain experience
+- Upsell / cross-sell
+- Loyalty programs
+""")
 
     st.download_button(
         "Download scored customers (CSV)",
@@ -583,5 +634,12 @@ with tab_how:
 
 5. **Assistant**  
    Optional Groq LLM answers questions using a data-driven context. If unavailable, a rule-based assistant responds.
+
+6. **How to interpret results**  
+   Churn probability is a ranking signal for prioritization, not a guarantee of churn.
+
+7. **Best practice**  
+   Use high-risk customers for targeted outreach and measure retention uplift over time.
+
 """
     )
