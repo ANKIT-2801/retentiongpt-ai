@@ -415,7 +415,46 @@ st.sidebar.write("Upload a CSV. If required columns are missing, you'll map them
 uploaded_file = st.sidebar.file_uploader("Upload customer data (CSV)", type=["csv"])
 
 if uploaded_file is None:
-    st.info("Upload a CSV from the left sidebar to begin scoring and analysis.")
+    st.markdown("## 👋 Welcome to RetentionGPT")
+
+    st.markdown("""
+RetentionGPT helps you:
+
+• Predict which customers are likely to churn  
+• Segment customers into Low / Medium / High risk  
+• Ask business questions about retention strategy  
+
+---
+
+### 📂 How to get started
+
+1. Upload a customer CSV from the left sidebar  
+2. If column names differ, map them when prompted  
+3. Review churn risk results  
+4. Ask questions in the Chat tab  
+
+---
+
+### 📌 Minimum required columns
+
+Your dataset must include (or be mappable to):
+
+- **Tenure** (how long customer has been active)
+- **Contract** (monthly, yearly, etc.)
+- **Total Charges** (total amount paid)
+
+Other columns are optional.
+
+---
+
+### 🎯 What you’ll get
+
+- A churn probability for each customer  
+- Risk band segmentation  
+- Action recommendations  
+- Downloadable scored dataset  
+""")
+
     st.stop()
 
 raw_bytes = uploaded_file.read()
