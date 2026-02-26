@@ -30,7 +30,7 @@ if "last_uploaded_file" not in st.session_state:
 
 st.title("RetentionGPT – Churn & Retention Assistant")
 st.caption("Upload your customer CSV, score churn risk, and ask an AI assistant for retention strategy.")
-
+st.caption("Designed for business teams — no data science background required.")
 MODEL_PATH = "models/retention_minimal_model.joblib"
 
 
