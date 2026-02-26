@@ -595,7 +595,7 @@ with tab_chat:
         st.session_state.messages.append({"role": "assistant", "content": reply})
 
 with tab_data:
-    st.subheader("Scored dataset preview")
+    st.subheader("Your Churn Risk Results")
     with st.expander("How to interpret these results"):
         st.markdown("""
 **What is churn probability?**  
