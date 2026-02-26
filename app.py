@@ -613,62 +613,62 @@ Each customer receives a probability between 0 and 1 representing likelihood of 
 """)
 
     # --- Metrics ---
-c1, c2, c3 = st.columns(3)
-with c1:
-    st.metric("Customers analysed", f"{ctx.get('n_customers', 0):,}")
-with c2:
-    if ctx.get("avg_risk") is not None:
-        st.metric("Avg churn risk", format_pct(ctx["avg_risk"]))
-    else:
-        st.metric("Avg churn risk", "N/A")
-with c3:
-    if ctx.get("p90_risk") is not None:
-        st.metric("Top 10% threshold", format_pct(ctx["p90_risk"]))
-    else:
-        st.metric("Top 10% threshold", "N/A")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Customers analysed", f"{ctx.get('n_customers', 0):,}")
+    with c2:
+        if ctx.get("avg_risk") is not None:
+            st.metric("Avg churn risk", format_pct(ctx["avg_risk"]))
+        else:
+            st.metric("Avg churn risk", "N/A")
+    with c3:
+        if ctx.get("p90_risk") is not None:
+            st.metric("Top 10% threshold", format_pct(ctx["p90_risk"]))
+        else:
+            st.metric("Top 10% threshold", "N/A")
 
-st.caption("Risk bands are relative within this uploaded dataset (top/middle/bottom third), not absolute industry benchmarks.")
+    st.caption("Risk bands are relative within this uploaded dataset (top/middle/bottom third), not absolute industry benchmarks.")
 
-# --- Quick Insight Summary ---
-st.subheader("📊 Quick Insight Summary")
+    # --- Quick Insight Summary ---
+    st.subheader("📊 Quick Insight Summary")
 
-high_count = int((scored_df["risk_band"] == "High risk").sum())
-total = int(len(scored_df))
+    high_count = int((scored_df["risk_band"] == "High risk").sum())
+    total = int(len(scored_df))
 
-avg_risk_val = ctx.get("avg_risk")
-avg_risk_text = format_pct(avg_risk_val) if avg_risk_val is not None else "N/A"
+    avg_risk_val = ctx.get("avg_risk")
+    avg_risk_text = format_pct(avg_risk_val) if avg_risk_val is not None else "N/A"
 
-st.markdown(f"""
+    st.markdown(f"""
 - **{high_count:,} out of {total:,} customers** are in the **High Risk** segment.
 - Average churn probability across the dataset: **{avg_risk_text}**
 - Recommended next step: start with the **Top High Risk Customers** list below and prioritize outreach.
 """)
 
-st.caption("High Risk = Needs Attention | Medium Risk = Monitor | Low Risk = Stable")
+    st.caption("High Risk = Needs Attention | Medium Risk = Monitor | Low Risk = Stable")
 
-# --- Sample preview ---
-st.write("**Sample of scored customers**")
-st.dataframe(scored_df.head(25), use_container_width=True)
+    # --- Sample preview ---
+    st.write("**Sample of scored customers**")
+    st.dataframe(scored_df.head(25), use_container_width=True)
 
-# --- Risk summary ---
-if ctx.get("segment_summary") is not None:
-    st.write("**Customer Risk Breakdown**")
-    st.dataframe(ctx["segment_summary"], use_container_width=True)
+    # --- Risk summary ---
+    if ctx.get("segment_summary") is not None:
+        st.write("**Customer Risk Breakdown**")
+        st.dataframe(ctx["segment_summary"], use_container_width=True)
 
-# --- Prioritization table ---
-st.subheader("Who to prioritize first (Top High Risk Customers)")
+    # --- Prioritization table ---
+    st.subheader("Who to prioritize first (Top High Risk Customers)")
 
-show_cols = [c for c in ["customer_id", "tenure", "contract", "totalcharges", "predicted_churn_proba", "risk_band"] if c in scored_df.columns]
+    show_cols = [c for c in ["customer_id", "tenure", "contract", "totalcharges", "predicted_churn_proba", "risk_band"] if c in scored_df.columns]
 
-st.dataframe(
-    scored_df.sort_values("predicted_churn_proba", ascending=False).head(25)[show_cols],
-    use_container_width=True
-)
+    st.dataframe(
+        scored_df.sort_values("predicted_churn_proba", ascending=False).head(25)[show_cols],
+        use_container_width=True
+    )
 
-# --- Recommended actions ---
-st.subheader("Recommended Actions by Segment")
+    # --- Recommended actions ---
+    st.subheader("Recommended Actions by Segment")
 
-st.markdown("""
+    st.markdown("""
 **High Risk**
 - Immediate outreach
 - Contract upgrade offers
@@ -684,13 +684,13 @@ st.markdown("""
 - Upsell / cross-sell
 - Loyalty programs
 """)
+
     st.download_button(
         "Download scored customers (CSV)",
         data=scored_df.to_csv(index=False),
         file_name="scored_customers.csv",
         mime="text/csv"
     )
-
 with tab_how:
     st.subheader("How this works (for your report & interviews)")
     st.markdown(
