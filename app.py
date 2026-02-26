@@ -416,43 +416,61 @@ uploaded_file = st.sidebar.file_uploader("Upload customer data (CSV)", type=["cs
 
 if uploaded_file is None:
     st.markdown("## 👋 Welcome to RetentionGPT")
+    st.caption("Designed for business teams — no data science background required.")
 
     st.markdown("""
 RetentionGPT helps you:
+- Predict which customers are likely to churn
+- Segment customers into **Low / Medium / High** risk
+- Ask plain-English questions and get retention recommendations
+""")
 
-• Predict which customers are likely to churn  
-• Segment customers into Low / Medium / High risk  
-• Ask business questions about retention strategy  
+    st.divider()
 
----
+    st.success("""
+### 🚀 Start Here
 
-### 📂 How to get started
+1) Upload your customer CSV (left sidebar)  
+2) If required columns are missing, map them once  
+3) Review the **High Risk** segment first  
+4) Use the **Chat** tab to ask what to do next  
 
-1. Upload a customer CSV from the left sidebar  
-2. If column names differ, map them when prompted  
-3. Review churn risk results  
-4. Ask questions in the Chat tab  
+You can’t break anything — upload and explore.
+""")
 
----
+    st.markdown("""
+### 🔄 How this works (simple view)
 
+Upload Data → Model Scores Risk → Customers Segmented → You Decide Action  
+No coding required.
+""")
+
+    st.markdown("""
 ### 📌 Minimum required columns
 
 Your dataset must include (or be mappable to):
-
 - **Tenure** (how long customer has been active)
 - **Contract** (monthly, yearly, etc.)
 - **Total Charges** (total amount paid)
 
 Other columns are optional.
+""")
 
----
+    st.markdown("""
+### ❗Important
 
-### 🎯 What you’ll get
+- This app does **not** change your data — it only reads it.
+- Risk bands are **relative within your uploaded dataset**, not industry benchmarks.
+- Churn probability is a **ranking signal**, not a guarantee of churn.
+""")
 
-- A churn probability for each customer  
-- Risk band segmentation  
-- Action recommendations  
-- Downloadable scored dataset  
+    st.markdown("""
+### ✅ What you’ll get after upload
+
+- A churn probability for each customer
+- A Low / Medium / High risk label
+- A quick summary + suggested actions
+- A downloadable scored CSV
 """)
 
     st.stop()
@@ -594,39 +612,63 @@ Each customer receives a probability between 0 and 1 representing likelihood of 
 - Monitor and upsell Low risk customers.
 """)
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.metric("Customers analysed", f"{ctx.get('n_customers', 0):,}")
-    with c2:
-        if ctx.get("avg_risk") is not None:
-            st.metric("Avg churn risk", format_pct(ctx["avg_risk"]))
-        else:
-            st.metric("Avg churn risk", "N/A")
-    with c3:
-        if ctx.get("p90_risk") is not None:
-            st.metric("Top 10% threshold", format_pct(ctx["p90_risk"]))
-        else:
-            st.metric("Top 10% threshold", "N/A")
-    st.caption("Risk bands are relative within this uploaded dataset (top/middle/bottom third), not absolute industry benchmarks.")
+    # --- Metrics ---
+c1, c2, c3 = st.columns(3)
+with c1:
+    st.metric("Customers analysed", f"{ctx.get('n_customers', 0):,}")
+with c2:
+    if ctx.get("avg_risk") is not None:
+        st.metric("Avg churn risk", format_pct(ctx["avg_risk"]))
+    else:
+        st.metric("Avg churn risk", "N/A")
+with c3:
+    if ctx.get("p90_risk") is not None:
+        st.metric("Top 10% threshold", format_pct(ctx["p90_risk"]))
+    else:
+        st.metric("Top 10% threshold", "N/A")
 
-    st.write("**Sample of scored customers**")
-    st.dataframe(scored_df.head(25), use_container_width=True)
+st.caption("Risk bands are relative within this uploaded dataset (top/middle/bottom third), not absolute industry benchmarks.")
 
-    if ctx.get("segment_summary") is not None:
-        st.write("**Risk-band summary**")
-        st.dataframe(ctx["segment_summary"], use_container_width=True)
-    st.subheader("Who to prioritize first (Top High Risk Customers)")
+# --- Quick Insight Summary ---
+st.subheader("📊 Quick Insight Summary")
 
-    show_cols = [c for c in ["customer_id", "tenure", "contract", "totalcharges", "predicted_churn_proba", "risk_band"] if c in scored_df.columns]
+high_count = int((scored_df["risk_band"] == "High risk").sum())
+total = int(len(scored_df))
 
-    st.dataframe(
-        scored_df.sort_values("predicted_churn_proba", ascending=False).head(25)[show_cols],
-        use_container_width=True
-    )
-        
-    st.subheader("Recommended Actions by Segment")
+avg_risk_val = ctx.get("avg_risk")
+avg_risk_text = format_pct(avg_risk_val) if avg_risk_val is not None else "N/A"
 
-    st.markdown("""
+st.markdown(f"""
+- **{high_count:,} out of {total:,} customers** are in the **High Risk** segment.
+- Average churn probability across the dataset: **{avg_risk_text}**
+- Recommended next step: start with the **Top High Risk Customers** list below and prioritize outreach.
+""")
+
+st.caption("High Risk = Needs Attention | Medium Risk = Monitor | Low Risk = Stable")
+
+# --- Sample preview ---
+st.write("**Sample of scored customers**")
+st.dataframe(scored_df.head(25), use_container_width=True)
+
+# --- Risk summary ---
+if ctx.get("segment_summary") is not None:
+    st.write("**Customer Risk Breakdown**")
+    st.dataframe(ctx["segment_summary"], use_container_width=True)
+
+# --- Prioritization table ---
+st.subheader("Who to prioritize first (Top High Risk Customers)")
+
+show_cols = [c for c in ["customer_id", "tenure", "contract", "totalcharges", "predicted_churn_proba", "risk_band"] if c in scored_df.columns]
+
+st.dataframe(
+    scored_df.sort_values("predicted_churn_proba", ascending=False).head(25)[show_cols],
+    use_container_width=True
+)
+
+# --- Recommended actions ---
+st.subheader("Recommended Actions by Segment")
+
+st.markdown("""
 **High Risk**
 - Immediate outreach
 - Contract upgrade offers
@@ -642,7 +684,6 @@ Each customer receives a probability between 0 and 1 representing likelihood of 
 - Upsell / cross-sell
 - Loyalty programs
 """)
-
     st.download_button(
         "Download scored customers (CSV)",
         data=scored_df.to_csv(index=False),
